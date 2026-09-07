@@ -35,6 +35,8 @@ export const TeamsManagement: React.FC = () => {
     deleteTeam,
     addMemberToTeam,
     removeMemberFromTeam,
+    removeLeaderFromTeam,
+    deleteUser,
     setActiveTab,
   } = useApp();
 
@@ -43,16 +45,23 @@ export const TeamsManagement: React.FC = () => {
   const [editingTeam, setEditingTeam] = useState<Team | null>(null);
   const [managingMembersTeam, setManagingMembersTeam] = useState<Team | null>(null);
 
+  // States for robust Leader Deletion Modal & Confirmation
+  const [deleteLeaderModalData, setDeleteLeaderModalData] = useState<{ team: Team; leader: User } | null>(null);
+  const [deletionReason, setDeletionReason] = useState('');
+  const [isDeletingLeader, setIsDeletingLeader] = useState(false);
+  const [deleteSuccessMessage, setDeleteSuccessMessage] = useState<string | null>(null);
+
   React.useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         if (showNewTeamModal) setShowNewTeamModal(false);
         if (managingMembersTeam) setManagingMembersTeam(null);
+        if (deleteLeaderModalData) setDeleteLeaderModalData(null);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [showNewTeamModal, managingMembersTeam]);
+  }, [showNewTeamModal, managingMembersTeam, deleteLeaderModalData]);
 
   // Form states for New / Edit Team
   const [teamName, setTeamName] = useState('');
@@ -81,8 +90,7 @@ export const TeamsManagement: React.FC = () => {
   const handleOpenCreateModal = () => {
     setEditingTeam(null);
     setTeamName('');
-    // Default leader: first gestor or current user
-    const defaultLeader = users.find((u) => u.role === 'gestor') || users[0];
+    const defaultLeader = users.find((u) => u.role === 'gestor');
     setTeamLeaderId(defaultLeader ? defaultLeader.id : '');
     setTeamMetaVgv(1500000);
     setTeamMetaUnidades(8);
@@ -95,7 +103,7 @@ export const TeamsManagement: React.FC = () => {
   const handleOpenEditModal = (team: Team) => {
     setEditingTeam(team);
     setTeamName(team.name);
-    setTeamLeaderId(team.leaderId);
+    setTeamLeaderId(team.leaderId || '');
     setTeamMetaVgv(team.monthlyTargetVgv || 1500000);
     setTeamMetaUnidades(team.metaUnidades || Math.round((team.monthlyTargetVgv || 1500000) / 220000));
     setTeamColor(team.color || '#10b981');
@@ -111,16 +119,20 @@ export const TeamsManagement: React.FC = () => {
       return;
     }
 
-    const leader = users.find((u) => u.id === teamLeaderId) || users[0];
+    const leader = users.find((u) => u.id === teamLeaderId);
+    const leaderId = leader ? leader.id : '';
+    const leaderName = leader ? leader.name : 'Líder Não Definido';
 
-    // Ensure leader is in memberIds
-    const finalMemberIds = Array.from(new Set([leader.id, ...selectedMemberIds]));
+    // Ensure leader is in memberIds only if leader is valid
+    const finalMemberIds = leaderId
+      ? Array.from(new Set([leaderId, ...selectedMemberIds]))
+      : selectedMemberIds;
 
     if (editingTeam) {
       updateTeam(editingTeam.id, {
         name: teamName.trim(),
-        leaderId: leader.id,
-        leaderName: leader.name,
+        leaderId,
+        leaderName,
         monthlyTargetVgv: Number(teamMetaVgv) || 1500000,
         metaUnidades: Number(teamMetaUnidades) || 8,
         color: teamColor,
@@ -129,8 +141,8 @@ export const TeamsManagement: React.FC = () => {
     } else {
       addTeam({
         name: teamName.trim(),
-        leaderId: leader.id,
-        leaderName: leader.name,
+        leaderId,
+        leaderName,
         memberIds: finalMemberIds,
         monthlyTargetVgv: Number(teamMetaVgv) || 1500000,
         currentVgv: 0,
@@ -143,6 +155,44 @@ export const TeamsManagement: React.FC = () => {
 
     setShowNewTeamModal(false);
     setEditingTeam(null);
+  };
+
+  // Unassign leader from team (Sets team leadership to Vago)
+  const handleUnassignLeader = (team: Team, leader: User) => {
+    if (
+      window.confirm(
+        `Deseja desvincular ${leader.name} da liderança da equipe "${team.name}"?\n\n` +
+          `A liderança da equipe passará a ficar com status "VAGO" e o corretor permanecerá no sistema para ser alocado livremente.`
+      )
+    ) {
+      removeLeaderFromTeam(team.id, false, `Desvinculação de liderança da equipe "${team.name}" pelo Administrador.`);
+      setDeleteSuccessMessage(`Liderança da equipe "${team.name}" desvinculada com sucesso e sincronizada com a nuvem.`);
+      setTimeout(() => setDeleteSuccessMessage(null), 3500);
+    }
+  };
+
+  // Confirm permanent deletion of leader
+  const handleConfirmLeaderPermanentDeletion = () => {
+    if (!deleteLeaderModalData) return;
+    const { team, leader } = deleteLeaderModalData;
+    setIsDeletingLeader(true);
+
+    try {
+      deleteUser(
+        leader.id,
+        deletionReason.trim() || `Exclusão definitiva de corretor/líder da equipe ${team.name} via Gestão de Equipes`
+      );
+      setDeleteSuccessMessage(
+        `Líder ${leader.name} foi removido definitivamente do sistema com limpeza em cascata e persistência confirmada no Firestore!`
+      );
+      setTimeout(() => setDeleteSuccessMessage(null), 4500);
+      setDeleteLeaderModalData(null);
+      setDeletionReason('');
+    } catch (err) {
+      alert('Erro ao excluir líder: ' + String(err));
+    } finally {
+      setIsDeletingLeader(false);
+    }
   };
 
   // Delete team
@@ -361,14 +411,7 @@ export const TeamsManagement: React.FC = () => {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {filteredTeams.map((team, idx) => {
             const members = users.filter((u) => (team.memberIds || []).includes(u.id) || u.teamId === team.id);
-            const leader = users.find((u) => u.id === team.leaderId) || {
-              id: team.leaderId,
-              name: team.leaderName || 'Líder Não Definido',
-              role: 'gestor',
-              avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150',
-              phone: '(44) 99999-0000',
-              creci: 'PR-00000',
-            };
+            const leader = users.find((u) => u.id === team.leaderId);
 
             const pct = team.monthlyTargetVgv > 0
               ? Math.min(100, Math.round(((team.currentVgv || 0) / team.monthlyTargetVgv) * 100))
@@ -414,47 +457,100 @@ export const TeamsManagement: React.FC = () => {
                     >
                       <Edit2 className="w-4 h-4" />
                     </button>
-                    <button
-                      onClick={() => handleDeleteTeam(team)}
-                      className="p-2 rounded-lg text-rose-500 hover:text-rose-700 hover:bg-rose-50 transition-colors"
-                      title="Excluir equipe inteira"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
+                    {currentUser.role === 'admin' && (
+                      <button
+                        onClick={() => handleDeleteTeam(team)}
+                        className="p-2 rounded-lg text-rose-500 hover:text-rose-700 hover:bg-rose-50 transition-colors"
+                        title="Excluir equipe inteira (Exclusivo Administrador)"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    )}
                   </div>
                 </div>
 
                 {/* Gestor / Leader Info Card */}
-                <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-3.5 flex items-center justify-between">
-                  <div className="flex items-center gap-3">
-                    <div className="relative">
-                      <img
-                        src={(leader as User).avatar || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150'}
-                        alt={(leader as User).name}
-                        className="w-10 h-10 rounded-full object-cover border-2 border-white shadow-xs"
-                      />
-                      <div className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-amber-500 text-white flex items-center justify-center shadow-xs">
-                        <Crown className="w-2.5 h-2.5" />
+                {leader ? (
+                  <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-3.5 flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="relative shrink-0">
+                        <img
+                          src={leader.avatar || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150'}
+                          alt={leader.name}
+                          className="w-10 h-10 rounded-full object-cover border-2 border-white shadow-xs"
+                        />
+                        <div className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-amber-500 text-white flex items-center justify-center shadow-xs">
+                          <Crown className="w-2.5 h-2.5" />
+                        </div>
+                      </div>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="text-xs font-bold text-slate-900 truncate">{leader.name}</span>
+                          <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-amber-100 text-amber-900 border border-amber-200 shrink-0">
+                            GESTOR
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 flex items-center gap-2 mt-0.5 truncate">
+                          <span>CRECI: {leader.creci || 'S/N'}</span>
+                          <span>•</span>
+                          <span className="flex items-center gap-0.5 truncate">
+                            <Phone className="w-3 h-3 text-slate-400 shrink-0" />
+                            {leader.phone || 'N/A'}
+                          </span>
+                        </p>
                       </div>
                     </div>
-                    <div>
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-xs font-bold text-slate-900">{(leader as User).name}</span>
-                        <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-amber-100 text-amber-900 border border-amber-200">
-                          GESTOR
-                        </span>
+
+                    {currentUser.role === 'admin' && (
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => handleUnassignLeader(team, leader)}
+                          className="px-2 py-1 rounded-lg bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 text-[10px] font-semibold transition-colors flex items-center gap-1"
+                          title={`Desvincular liderança da equipe "${team.name}" (liderança ficará vaga)`}
+                        >
+                          <UserMinus className="w-3 h-3" />
+                          <span>Desvincular</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setDeleteLeaderModalData({ team, leader })}
+                          className="p-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 text-[10px] font-semibold transition-colors"
+                          title={`Excluir ${leader.name} definitivamente do sistema (com limpeza em cascata)`}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
                       </div>
-                      <p className="text-[11px] text-slate-500 flex items-center gap-2 mt-0.5">
-                        <span>CRECI: {(leader as User).creci || 'PR-00000'}</span>
-                        <span>•</span>
-                        <span className="flex items-center gap-0.5">
-                          <Phone className="w-3 h-3 text-slate-400" />
-                          {(leader as User).phone || 'N/A'}
-                        </span>
-                      </p>
-                    </div>
+                    )}
                   </div>
-                </div>
+                ) : (
+                  <div className="bg-amber-50/60 border border-amber-200/80 rounded-xl p-3.5 flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-full bg-amber-100 text-amber-600 flex items-center justify-center font-bold text-sm">
+                        <UserCheck className="w-5 h-5" />
+                      </div>
+                      <div>
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-xs font-bold text-amber-900">Líder Não Atribuído</span>
+                          <span className="px-1.5 py-0.2 rounded text-[9px] font-bold bg-amber-200 text-amber-900">
+                            VAGO
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-amber-700 mt-0.5">
+                          Nenhum gestor ativo vinculado a esta equipe.
+                        </p>
+                      </div>
+                    </div>
+                    {currentUser.role === 'admin' && (
+                      <button
+                        onClick={() => handleOpenEditModal(team)}
+                        className="text-[11px] font-semibold text-emerald-700 bg-emerald-100 hover:bg-emerald-200 border border-emerald-300 px-2.5 py-1 rounded-lg shadow-2xs transition-colors"
+                      >
+                        + Definir
+                      </button>
+                    )}
+                  </div>
+                )}
 
                 {/* Progress & Target Section */}
                 <div className="space-y-2 pt-2 border-t border-slate-100">
@@ -605,18 +701,17 @@ export const TeamsManagement: React.FC = () => {
               {/* Gestor / Líder da Equipe */}
               <div>
                 <label className="block font-bold text-slate-800 mb-1">
-                  2º Gestor / Líder Responsável <span className="text-rose-500">*</span>
+                  2º Gestor / Líder Responsável (Opcional)
                 </label>
                 <select
-                  required
                   value={teamLeaderId}
                   onChange={(e) => setTeamLeaderId(e.target.value)}
                   className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white text-slate-900 focus:ring-2 focus:ring-emerald-500"
                 >
-                  <option value="">Selecione o Gestor / Líder...</option>
+                  <option value="">-- Sem Líder Definido (Deixar Vago) --</option>
                   {users.map((u) => (
                     <option key={u.id} value={u.id}>
-                      {u.name} ({u.role.toUpperCase()}) - CRECI: {u.creci}
+                      {u.name} ({u.role.toUpperCase()}) - CRECI: {u.creci || 'S/N'}
                     </option>
                   ))}
                 </select>
@@ -861,6 +956,118 @@ export const TeamsManagement: React.FC = () => {
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Robust Leader / Broker Deletion Confirmation Modal */}
+      {deleteLeaderModalData && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/60 backdrop-blur-xs animate-in fade-in duration-200">
+          <div className="bg-white dark:bg-slate-900 rounded-2xl shadow-2xl border border-rose-200 dark:border-rose-900/50 max-w-lg w-full overflow-hidden flex flex-col">
+            {/* Header */}
+            <div className="px-6 py-4 bg-rose-50/80 dark:bg-rose-950/40 border-b border-rose-100 dark:border-rose-900/40 flex items-center justify-between">
+              <div className="flex items-center gap-2.5 text-rose-700 dark:text-rose-400">
+                <div className="w-8 h-8 rounded-xl bg-rose-100 dark:bg-rose-900/60 flex items-center justify-center shrink-0">
+                  <Trash2 className="w-4 h-4 text-rose-600" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold leading-tight">Exclusão Definitiva de Corretor / Líder</h3>
+                  <p className="text-[11px] text-rose-600/80 dark:text-rose-400/80">
+                    Limpeza em cascata e persistência imediata no banco de dados Firestore
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDeleteLeaderModalData(null)}
+                className="p-1 rounded-lg text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 hover:bg-rose-100/50 transition-colors"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Content */}
+            <div className="p-6 space-y-4">
+              {/* User details card */}
+              <div className="bg-slate-50 dark:bg-slate-800/80 border border-slate-200/80 dark:border-slate-700/80 rounded-xl p-3.5 flex items-center gap-3">
+                <img
+                  src={deleteLeaderModalData.leader.avatar || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150'}
+                  alt={deleteLeaderModalData.leader.name}
+                  className="w-12 h-12 rounded-full object-cover border-2 border-white shadow-xs shrink-0"
+                />
+                <div className="min-w-0">
+                  <h4 className="text-sm font-bold text-slate-900 dark:text-white truncate">
+                    {deleteLeaderModalData.leader.name}
+                  </h4>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 truncate">
+                    {deleteLeaderModalData.leader.email} • CRECI: {deleteLeaderModalData.leader.creci || 'S/N'}
+                  </p>
+                  <p className="text-[11px] text-amber-700 dark:text-amber-400 font-semibold mt-0.5">
+                    Líder atual da equipe: "{deleteLeaderModalData.team.name}"
+                  </p>
+                </div>
+              </div>
+
+              {/* Cascade warning box */}
+              <div className="bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900/50 rounded-xl p-3.5 text-xs text-amber-900 dark:text-amber-300 space-y-1.5">
+                <p className="font-bold flex items-center gap-1.5 text-amber-800 dark:text-amber-200">
+                  <Info className="w-4 h-4 shrink-0" />
+                  Operações de exclusão executadas atomicamente:
+                </p>
+                <ul className="list-disc pl-5 space-y-1 text-[11px] text-amber-800 dark:text-amber-300">
+                  <li>Remoção permanente da lista de usuários e corretores ativos.</li>
+                  <li>Desvinculação automática da equipe (a equipe passará a ter status "Líder Vago").</li>
+                  <li>Remoção de todas as escalas de plantão, registros de presença e histórico de roleta.</li>
+                  <li>Gravação síncrona definitiva no Firestore para evitar que o corretor retorne.</li>
+                  <li>Registro no livro permanente de auditoria de exclusões (<code className="font-mono bg-amber-100 dark:bg-amber-900/50 px-1 py-0.5 rounded">deletion_audit_logs</code>).</li>
+                </ul>
+              </div>
+
+              {/* Justification input */}
+              <div>
+                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                  Motivo da Exclusão (Gravado no Log Fiscal de Auditoria)
+                </label>
+                <input
+                  type="text"
+                  placeholder="Ex: Desligamento da imobiliária, solicitação de encerramento..."
+                  value={deletionReason}
+                  onChange={(e) => setDeletionReason(e.target.value)}
+                  className="w-full px-3 py-2 text-xs rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-rose-500"
+                />
+              </div>
+            </div>
+
+            {/* Actions */}
+            <div className="px-6 py-4 bg-slate-50 dark:bg-slate-900/90 border-t border-slate-100 dark:border-slate-800 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setDeleteLeaderModalData(null)}
+                disabled={isDeletingLeader}
+                className="px-4 py-2 rounded-xl text-xs font-semibold text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-800 transition-colors"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmLeaderPermanentDeletion}
+                disabled={isDeletingLeader}
+                className="px-4 py-2 rounded-xl text-xs font-bold text-white bg-rose-600 hover:bg-rose-700 active:scale-98 transition-all shadow-md shadow-rose-600/20 flex items-center gap-1.5"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>{isDeletingLeader ? 'Excluindo e Persistindo...' : 'Confirmar Exclusão Definitiva'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Floating Success Toast Alert */}
+      {deleteSuccessMessage && (
+        <div className="fixed bottom-6 right-6 z-50 max-w-md bg-emerald-900 text-white px-4 py-3 rounded-2xl shadow-xl border border-emerald-700 flex items-center gap-3 animate-in slide-in-from-bottom-5 duration-300">
+          <div className="w-8 h-8 rounded-xl bg-emerald-500/20 text-emerald-300 flex items-center justify-center shrink-0">
+            <CheckCircle2 className="w-5 h-5" />
+          </div>
+          <p className="text-xs font-medium leading-relaxed">{deleteSuccessMessage}</p>
         </div>
       )}
     </div>

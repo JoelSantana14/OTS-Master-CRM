@@ -1,5 +1,5 @@
-import React, { createContext, useContext, useState, useEffect, useMemo } from 'react';
-import { loadStateFromCloud, saveStateToCloud, subscribeToCloudState } from '../services/firestoreService';
+import React, { createContext, useContext, useState, useEffect, useMemo, useRef } from 'react';
+import { loadStateFromCloud, saveStateToCloud, subscribeToCloudState, logDeletionToFirestore, subscribeToDeletionLogs } from '../services/firestoreService';
 import { playNotificationChime } from '../utils/soundService';
 import {
   User,
@@ -27,6 +27,7 @@ import {
   PartnerAgency,
   PartnerVisitAttendance,
   ProposalApprovalRequest,
+  DeletionAuditRecord,
 } from '../types';
 import {
   initialSettings,
@@ -103,7 +104,7 @@ interface AppContextType {
   users: User[];
   addUser: (user: Omit<User, 'id'>) => User;
   updateUser: (userId: string, updates: Partial<User>) => void;
-  deleteUser: (userId: string) => void;
+  deleteUser: (userId: string, motivo?: string) => void;
   changeUserPassword: (userId: string, currentPass: string, newPass: string, isAdminOverride?: boolean) => { success: boolean; message: string };
   resetUserPasswordToDefault: (userId: string) => { success: boolean; newPassword: string; message: string };
   teams: Team[];
@@ -144,6 +145,7 @@ interface AppContextType {
   deleteTeam: (teamId: string) => void;
   addMemberToTeam: (teamId: string, userId: string) => void;
   removeMemberFromTeam: (teamId: string, userId: string) => void;
+  removeLeaderFromTeam: (teamId: string, deletePermanently?: boolean, motivo?: string) => void;
 
   // User Approvals
   approveUser: (userId: string) => void;
@@ -226,9 +228,18 @@ interface AppContextType {
   deleteCommission: (commissionId: string) => void;
   updateCommissionStatus: (commissionId: string, status: Commission['status']) => void;
 
-  // Audit Logs
+  // Audit Logs & Deletions
   auditLogs: AuditLog[];
   logAction: (acao: string, entidade: string, detalhes: string) => void;
+  deletionLogs: DeletionAuditRecord[];
+  recordDeletionAudit: (
+    entityType: DeletionAuditRecord['entityType'],
+    recordId: string,
+    recordIdentifier: string,
+    detalhes: string,
+    snapshot?: any,
+    motivo?: string
+  ) => Promise<DeletionAuditRecord | null>;
 
   // Backup & Reset
   exportDatabaseJson: () => string;
@@ -271,30 +282,28 @@ const AppContext = createContext<AppContextType | undefined>(undefined);
 
 const STORAGE_KEY = 'jardim_vivencia_app_db_v1_10';
 
-// Helper to guarantee default users (including admin) are always present without key collisions
-const mergeUsersWithInitial = (loadedUsers: User[] = []): User[] => {
-  const userMap = new Map<string, User>();
+// Helper to guarantee admin is present without resurrecting deleted brokers
+const mergeUsersWithInitial = (loadedUsers?: User[]): User[] => {
+  if (!loadedUsers) {
+    return initialUsers;
+  }
+  if (loadedUsers.length === 0) {
+    const adminUser = initialUsers.find((u) => u.role === 'admin') || initialUsers[0];
+    return [adminUser];
+  }
 
-  // 1. Add default initial users by ID
-  initialUsers.forEach((iu) => {
-    if (iu && iu.id) {
-      userMap.set(iu.id, iu);
-    }
-  });
+  // Ensure at least one administrator account exists so access is never lost
+  const adminUser = initialUsers.find((u) => u.role === 'admin') || initialUsers[0];
+  const hasAdmin = loadedUsers.some((u) => u.role === 'admin');
 
-  // 2. Merge loaded users by ID (overriding initial user properties if matching ID)
-  loadedUsers.forEach((u) => {
-    if (u && u.id) {
-      userMap.set(u.id, u);
-    }
-  });
+  const baseList = hasAdmin ? [...loadedUsers] : [adminUser, ...loadedUsers];
 
-  // 3. Ensure strict uniqueness on both ID and Email
+  // Ensure strict uniqueness on both ID and Email
   const result: User[] = [];
   const seenIds = new Set<string>();
   const seenEmails = new Set<string>();
 
-  for (const u of userMap.values()) {
+  for (const u of baseList) {
     if (!u || !u.id) continue;
     const emailKey = u.email ? u.email.trim().toLowerCase() : '';
 
@@ -339,6 +348,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           proposalApprovalRequests: parsed.proposalApprovalRequests || [],
           currentUserId: parsed.currentUserId || 'user-admin',
           isAuthenticated: parsed.isAuthenticated !== undefined ? parsed.isAuthenticated : false,
+          initialUpdatedAt: parsed.updatedAt ? new Date(parsed.updatedAt).getTime() : 0,
         };
       }
     } catch (e) {
@@ -367,10 +377,27 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       proposalApprovalRequests: [],
       currentUserId: 'user-admin',
       isAuthenticated: false,
+      initialUpdatedAt: 0,
     };
   };
 
   const initialData = loadInitialData();
+  const lastLocalSaveTimeRef = useRef<number>(initialData.initialUpdatedAt || 0);
+  const hasUserEditedRef = useRef<boolean>(false);
+
+  const loadDeletedUserIds = (): Set<string> => {
+    try {
+      const stored = localStorage.getItem('jv_deleted_user_ids');
+      if (stored) {
+        return new Set(JSON.parse(stored));
+      }
+    } catch {
+      // ignore
+    }
+    return new Set();
+  };
+
+  const deletedUserIdsRef = useRef<Set<string>>(loadDeletedUserIds());
 
   const [settings, setSettings] = useState<AppSettings>(initialData.settings);
   const [users, setUsers] = useState<User[]>(initialData.users);
@@ -384,6 +411,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [rouletteHistory, setRouletteHistory] = useState<RouletteRecord[]>(initialData.rouletteHistory);
   const [commissions, setCommissions] = useState<Commission[]>(initialData.commissions);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>(initialData.auditLogs);
+  const [deletionLogs, setDeletionLogs] = useState<DeletionAuditRecord[]>([]);
   const [notifications, setNotifications] = useState<AppNotification[]>(initialData.notifications);
   const [shiftRules, setShiftRules] = useState<ShiftRule[]>(initialData.shiftRules);
   const [deletedLeads, setDeletedLeads] = useState<DeletedLeadRecord[]>(initialData.deletedLeads);
@@ -399,6 +427,87 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return found || initialData.users[0];
   });
 
+  const currentUserRef = useRef<User>(currentUser);
+  useEffect(() => {
+    currentUserRef.current = currentUser;
+  }, [currentUser]);
+
+  // Master State Reference - ALWAYS kept 100% up-to-date synchronously
+  const stateRef = useRef({
+    settings: initialData.settings,
+    users: initialData.users,
+    teams: initialData.teams,
+    units: initialData.units,
+    leads: initialData.leads,
+    visits: initialData.visits,
+    tasks: initialData.tasks,
+    scales: initialData.scales,
+    attendances: initialData.attendances,
+    rouletteHistory: initialData.rouletteHistory,
+    commissions: initialData.commissions,
+    auditLogs: initialData.auditLogs,
+    notifications: initialData.notifications,
+    shiftRules: initialData.shiftRules,
+    deletedLeads: initialData.deletedLeads,
+    tags: initialData.tags,
+    simulatorPolicyRules: initialData.simulatorPolicyRules,
+    partnerAgencies: initialData.partnerAgencies,
+    partnerVisits: initialData.partnerVisits,
+    proposalApprovalRequests: initialData.proposalApprovalRequests || [],
+    currentUserId: initialData.currentUserId,
+    isAuthenticated: initialData.isAuthenticated,
+    updatedAt: new Date().toISOString(),
+  });
+
+  // Master State Updater & Cloud Sync Engine
+  const updateAndPersist = (updates: Record<string, any>) => {
+    hasUserEditedRef.current = true;
+    const nowIso = new Date().toISOString();
+    lastLocalSaveTimeRef.current = new Date(nowIso).getTime();
+
+    const newState = {
+      ...stateRef.current,
+      ...updates,
+      currentUserId: currentUserRef.current?.id || stateRef.current.currentUserId || 'user-admin',
+      updatedAt: nowIso,
+    };
+    stateRef.current = newState;
+
+    if (updates.settings !== undefined) setSettings(updates.settings);
+    if (updates.users !== undefined) setUsers(updates.users);
+    if (updates.teams !== undefined) setTeams(updates.teams);
+    if (updates.units !== undefined) setUnits(updates.units);
+    if (updates.leads !== undefined) setLeads(updates.leads);
+    if (updates.visits !== undefined) setVisits(updates.visits);
+    if (updates.tasks !== undefined) setTasks(updates.tasks);
+    if (updates.scales !== undefined) setScales(updates.scales);
+    if (updates.attendances !== undefined) setAttendances(updates.attendances);
+    if (updates.rouletteHistory !== undefined) setRouletteHistory(updates.rouletteHistory);
+    if (updates.commissions !== undefined) setCommissions(updates.commissions);
+    if (updates.auditLogs !== undefined) setAuditLogs(updates.auditLogs);
+    if (updates.notifications !== undefined) setNotifications(updates.notifications);
+    if (updates.shiftRules !== undefined) setShiftRules(updates.shiftRules);
+    if (updates.deletedLeads !== undefined) setDeletedLeads(updates.deletedLeads);
+    if (updates.tags !== undefined) setTags(updates.tags);
+    if (updates.simulatorPolicyRules !== undefined) setSimulatorPolicyRules(updates.simulatorPolicyRules);
+    if (updates.partnerAgencies !== undefined) setPartnerAgencies(updates.partnerAgencies);
+    if (updates.partnerVisits !== undefined) setPartnerVisits(updates.partnerVisits);
+    if (updates.proposalApprovalRequests !== undefined) setProposalApprovalRequests(updates.proposalApprovalRequests);
+    if (updates.isAuthenticated !== undefined) setIsAuthenticated(updates.isAuthenticated);
+
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(newState));
+    } catch (e) {
+      console.error('LocalStorage write error:', e);
+    }
+
+    saveStateToCloud(newState, true);
+  };
+
+  const persistFullStateDirectly = (partialUpdates: Record<string, any> = {}) => {
+    updateAndPersist(partialUpdates);
+  };
+
   const [activeTab, setActiveTab] = useState<string>('boas_vindas');
   const [selectedUnitForSimulator, setSelectedUnitForSimulator] = useState<Unit | null>(null);
   const [selectedLeadForModal, setSelectedLeadForModal] = useState<Lead | null>(null);
@@ -411,7 +520,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const setTheme = (newTheme: 'light' | 'dark') => {
     setThemeState(newTheme);
-    setSettings((prev) => ({ ...prev, theme: newTheme }));
+    updateAndPersist({ settings: { ...stateRef.current.settings, theme: newTheme } });
   };
 
   const toggleTheme = () => {
@@ -458,12 +567,29 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return;
       }
 
+      // Conflict Resolution: ONLY reject cloud update if the user has explicitly edited data in this session AND cloud snapshot is older
+      if (cloudData.updatedAt) {
+        const cloudTime = new Date(cloudData.updatedAt).getTime();
+        if (hasUserEditedRef.current && cloudTime && lastLocalSaveTimeRef.current && cloudTime < lastLocalSaveTimeRef.current - 1500) {
+          console.warn('Received cloud update older than current local user session edit. Preserving local session state.', { cloudTime, localTime: lastLocalSaveTimeRef.current });
+          setIsCloudHydrated(true);
+          return;
+        }
+        if (cloudTime) {
+          lastLocalSaveTimeRef.current = cloudTime;
+        }
+      }
+
       if (cloudData.settings) {
+        stateRef.current.settings = cloudData.settings;
         setSettings((prev) => (JSON.stringify(prev) === JSON.stringify(cloudData.settings) ? prev : cloudData.settings));
       }
 
       if (cloudData.users) {
-        const merged = mergeUsersWithInitial(cloudData.users);
+        // Strict Deletion Protection: Filter out any users known to be deleted
+        const activeUsers = (cloudData.users as User[]).filter((u) => !deletedUserIdsRef.current.has(u.id));
+        const merged = mergeUsersWithInitial(activeUsers);
+        stateRef.current.users = merged;
         setUsers((prev) => (JSON.stringify(prev) === JSON.stringify(merged) ? prev : merged));
 
         // Sync currentUser if updated in users array
@@ -477,60 +603,95 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
 
       if (cloudData.teams) {
-        setTeams((prev) => (JSON.stringify(prev) === JSON.stringify(cloudData.teams) ? prev : cloudData.teams));
+        const sanitizedTeams = (cloudData.teams as Team[]).map((t) => {
+          const isLeaderDeleted = t.leaderId && deletedUserIdsRef.current.has(t.leaderId);
+          const sanitizedMembers = (t.memberIds || []).filter((id) => !deletedUserIdsRef.current.has(id));
+          if (isLeaderDeleted) {
+            return {
+              ...t,
+              leaderId: '',
+              leaderName: 'Líder Não Definido',
+              memberIds: sanitizedMembers,
+            };
+          }
+          return {
+            ...t,
+            memberIds: sanitizedMembers,
+          };
+        });
+        stateRef.current.teams = sanitizedTeams;
+        setTeams((prev) => (JSON.stringify(prev) === JSON.stringify(sanitizedTeams) ? prev : sanitizedTeams));
       }
       if (cloudData.units) {
+        stateRef.current.units = cloudData.units;
         setUnits((prev) => (JSON.stringify(prev) === JSON.stringify(cloudData.units) ? prev : cloudData.units));
       }
       if (cloudData.leads) {
+        stateRef.current.leads = cloudData.leads;
         setLeads((prev) => (JSON.stringify(prev) === JSON.stringify(cloudData.leads) ? prev : cloudData.leads));
       }
       if (cloudData.visits) {
+        stateRef.current.visits = cloudData.visits;
         setVisits((prev) => (JSON.stringify(prev) === JSON.stringify(cloudData.visits) ? prev : cloudData.visits));
       }
       if (cloudData.tasks) {
+        stateRef.current.tasks = cloudData.tasks;
         setTasks((prev) => (JSON.stringify(prev) === JSON.stringify(cloudData.tasks) ? prev : cloudData.tasks));
       }
       if (cloudData.scales) {
+        stateRef.current.scales = cloudData.scales;
         setScales((prev) => (JSON.stringify(prev) === JSON.stringify(cloudData.scales) ? prev : cloudData.scales));
       }
       if (cloudData.attendances) {
+        stateRef.current.attendances = cloudData.attendances;
         setAttendances((prev) => (JSON.stringify(prev) === JSON.stringify(cloudData.attendances) ? prev : cloudData.attendances));
       }
       if (cloudData.rouletteHistory) {
+        stateRef.current.rouletteHistory = cloudData.rouletteHistory;
         setRouletteHistory((prev) => (JSON.stringify(prev) === JSON.stringify(cloudData.rouletteHistory) ? prev : cloudData.rouletteHistory));
       }
       if (cloudData.commissions) {
+        stateRef.current.commissions = cloudData.commissions;
         setCommissions((prev) => (JSON.stringify(prev) === JSON.stringify(cloudData.commissions) ? prev : cloudData.commissions));
       }
       if (cloudData.auditLogs) {
+        stateRef.current.auditLogs = cloudData.auditLogs;
         setAuditLogs((prev) => (JSON.stringify(prev) === JSON.stringify(cloudData.auditLogs) ? prev : cloudData.auditLogs));
       }
       if (cloudData.notifications) {
+        stateRef.current.notifications = cloudData.notifications;
         setNotifications((prev) => (JSON.stringify(prev) === JSON.stringify(cloudData.notifications) ? prev : cloudData.notifications));
       }
       if (cloudData.shiftRules) {
+        stateRef.current.shiftRules = cloudData.shiftRules;
         setShiftRules((prev) => (JSON.stringify(prev) === JSON.stringify(cloudData.shiftRules) ? prev : cloudData.shiftRules));
       }
       if (cloudData.deletedLeads) {
+        stateRef.current.deletedLeads = cloudData.deletedLeads;
         setDeletedLeads((prev) => (JSON.stringify(prev) === JSON.stringify(cloudData.deletedLeads) ? prev : cloudData.deletedLeads));
       }
       if (cloudData.tags) {
+        stateRef.current.tags = cloudData.tags;
         setTags((prev) => (JSON.stringify(prev) === JSON.stringify(cloudData.tags) ? prev : cloudData.tags));
       }
       if (cloudData.simulatorPolicyRules) {
+        stateRef.current.simulatorPolicyRules = cloudData.simulatorPolicyRules;
         setSimulatorPolicyRules((prev) => (JSON.stringify(prev) === JSON.stringify(cloudData.simulatorPolicyRules) ? prev : cloudData.simulatorPolicyRules));
       }
       if (cloudData.partnerAgencies) {
+        stateRef.current.partnerAgencies = cloudData.partnerAgencies;
         setPartnerAgencies((prev) => (JSON.stringify(prev) === JSON.stringify(cloudData.partnerAgencies) ? prev : cloudData.partnerAgencies));
       }
       if (cloudData.partnerVisits) {
+        stateRef.current.partnerVisits = cloudData.partnerVisits;
         setPartnerVisits((prev) => (JSON.stringify(prev) === JSON.stringify(cloudData.partnerVisits) ? prev : cloudData.partnerVisits));
       }
       if (cloudData.proposalApprovalRequests) {
+        stateRef.current.proposalApprovalRequests = cloudData.proposalApprovalRequests;
         setProposalApprovalRequests((prev) => (JSON.stringify(prev) === JSON.stringify(cloudData.proposalApprovalRequests) ? prev : cloudData.proposalApprovalRequests));
       }
       if (cloudData.isAuthenticated !== undefined) {
+        stateRef.current.isAuthenticated = cloudData.isAuthenticated;
         setIsAuthenticated((prev) => (prev === cloudData.isAuthenticated ? prev : cloudData.isAuthenticated));
       }
       console.log('Successfully synchronized state from Firestore cloud in real time.');
@@ -540,143 +701,58 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return () => unsubscribe();
   }, []);
 
+  // Real-time synchronization for Deletion Audit Logs
+  useEffect(() => {
+    const unsubDeletion = subscribeToDeletionLogs((logs) => {
+      if (logs) {
+        setDeletionLogs(logs);
+        logs.forEach((l) => {
+          if (l.entityType === 'usuario_corretor' && l.recordId) {
+            deletedUserIdsRef.current.add(l.recordId);
+          }
+        });
+        try {
+          localStorage.setItem('jv_deleted_user_ids', JSON.stringify(Array.from(deletedUserIdsRef.current)));
+        } catch {
+          // ignore
+        }
+      }
+    });
+    return () => {
+      unsubDeletion();
+    };
+  }, []);
+
   // Immediate cloud save helper function for critical edits
   const forceSaveToCloudImmediate = () => {
-    if (!isCloudHydrated) return;
-    const dbState = {
-      settings,
-      users,
-      teams,
-      units,
-      leads,
-      visits,
-      tasks,
-      scales,
-      attendances,
-      rouletteHistory,
-      commissions,
-      auditLogs,
-      notifications,
-      shiftRules,
-      deletedLeads,
-      tags,
-      simulatorPolicyRules,
-      partnerAgencies,
-      partnerVisits,
-      proposalApprovalRequests,
-      currentUserId: currentUser.id,
-      isAuthenticated,
-    };
-    saveStateToCloud(dbState);
+    updateAndPersist({});
   };
 
-  // Immediate Save on page switch or window close/minimize
+  // Immediate Save on page switch or window close/minimize/refresh
   useEffect(() => {
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'hidden' && isCloudHydrated) {
-        console.log('Page became hidden. Saving current state immediately to Firestore...');
+    const handleSave = () => {
+      if (isCloudHydrated) {
+        console.log('Window closing or page hidden. Saving state immediately to LocalStorage and Firestore...');
         forceSaveToCloudImmediate();
       }
     };
 
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        handleSave();
+      }
+    };
+
     document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('beforeunload', handleSave);
+    window.addEventListener('pagehide', handleSave);
+
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('beforeunload', handleSave);
+      window.removeEventListener('pagehide', handleSave);
     };
-  }, [
-    isCloudHydrated,
-    settings,
-    users,
-    teams,
-    units,
-    leads,
-    visits,
-    tasks,
-    scales,
-    attendances,
-    rouletteHistory,
-    commissions,
-    auditLogs,
-    notifications,
-    shiftRules,
-    deletedLeads,
-    tags,
-    simulatorPolicyRules,
-    partnerAgencies,
-    partnerVisits,
-    proposalApprovalRequests,
-    currentUser,
-    isAuthenticated,
-  ]);
-
-  // Sync to LocalStorage & Firestore Cloud (debounced with fast 500ms responsiveness)
-  useEffect(() => {
-    if (!isCloudHydrated) {
-      console.log('Skipping cloud save: cloud database is not yet hydrated.');
-      return;
-    }
-
-    const dbState = {
-      settings,
-      users,
-      teams,
-      units,
-      leads,
-      visits,
-      tasks,
-      scales,
-      attendances,
-      rouletteHistory,
-      commissions,
-      auditLogs,
-      notifications,
-      shiftRules,
-      deletedLeads,
-      tags,
-      simulatorPolicyRules,
-      partnerAgencies,
-      partnerVisits,
-      proposalApprovalRequests,
-      currentUserId: currentUser.id,
-      isAuthenticated,
-    };
-
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(dbState));
-    } catch (e) {
-      console.error('LocalStorage save error:', e);
-    }
-
-    const handler = setTimeout(() => {
-      saveStateToCloud(dbState);
-    }, 1000);
-
-    return () => clearTimeout(handler);
-  }, [
-    isCloudHydrated,
-    settings,
-    users,
-    teams,
-    units,
-    leads,
-    visits,
-    tasks,
-    scales,
-    attendances,
-    rouletteHistory,
-    commissions,
-    auditLogs,
-    notifications,
-    shiftRules,
-    deletedLeads,
-    tags,
-    simulatorPolicyRules,
-    partnerAgencies,
-    partnerVisits,
-    proposalApprovalRequests,
-    currentUser,
-    isAuthenticated,
-  ]);
+  }, [isCloudHydrated]);
 
   const loginDetailed = (
     email: string,
@@ -685,10 +761,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const cleanEmail = email.trim().toLowerCase();
     let user = users.find((u) => u.email.trim().toLowerCase() === cleanEmail);
 
-    // Fallback if not currently in state array
+    // Fallback if admin is somehow not currently in state array
     if (!user) {
       const initialMatch = initialUsers.find((iu) => iu.email.trim().toLowerCase() === cleanEmail);
-      if (initialMatch) {
+      if (initialMatch && initialMatch.role === 'admin') {
         user = initialMatch;
         setUsers((prev) => {
           const exists = prev.some((u) => u.email.trim().toLowerCase() === cleanEmail);
@@ -767,6 +843,66 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       detalhes,
     };
     setAuditLogs((prev) => [newLog, ...prev]);
+  };
+
+  const recordDeletionAudit = async (
+    entityType: DeletionAuditRecord['entityType'],
+    recordId: string,
+    recordIdentifier: string,
+    detalhes: string,
+    snapshot?: any,
+    motivo?: string
+  ): Promise<DeletionAuditRecord | null> => {
+    const now = new Date();
+    const dateStr = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+    const randomHex = Math.random().toString(36).substring(2, 8).toUpperCase();
+    const protocol = `DEL-${dateStr}-${randomHex}`;
+
+    const record: DeletionAuditRecord = {
+      id: protocol,
+      timestamp: now.toISOString(),
+      dataHoraFormatada: now.toLocaleString('pt-BR'),
+      deletedBy: {
+        userId: currentUser.id,
+        userName: currentUser.name,
+        userEmail: currentUser.email,
+        userRole: currentUser.role,
+      },
+      entityType,
+      recordId,
+      recordIdentifier,
+      detalhes,
+      motivo: motivo || 'Exclusão autorizada pelo Administrador.',
+      snapshot: snapshot ? JSON.parse(JSON.stringify(snapshot)) : undefined,
+    };
+
+    // Update local deletion logs
+    setDeletionLogs((prev) => [record, ...prev]);
+
+    // Persist directly to Firestore collection deletion_audit_logs
+    try {
+      await logDeletionToFirestore(record);
+    } catch (err) {
+      console.warn('Erro ao registrar log de exclusão no Firestore:', err);
+    }
+
+    // Mirror to general auditLogs
+    const formatted = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+    const newLog: AuditLog = {
+      id: `audit-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      timestamp: formatted,
+      userId: currentUser.id,
+      userName: currentUser.name,
+      userRole: currentUser.role,
+      acao: `Exclusão: ${entityType.toUpperCase()}`,
+      entidade: 'Auditoria de Exclusões',
+      detalhes: `[${protocol}] "${recordIdentifier}" excluído por ${currentUser.name} (${currentUser.role}). ${detalhes}`,
+      recordId,
+      snapshot: record.snapshot,
+    };
+    setAuditLogs((prev) => [newLog, ...prev]);
+
+    return record;
   };
 
   // Change Password by User or Admin
@@ -874,7 +1010,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       dataCriacao: new Date().toLocaleDateString('pt-BR'),
     };
 
-    setUsers((prev) => [...prev, newUser]);
+    const updatedUsers = [...users, newUser];
+    setUsers(updatedUsers);
 
     if (isPending) {
       logAction(
@@ -897,14 +1034,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       );
     }
 
+    persistFullStateDirectly({ users: updatedUsers });
+
     return newUser;
   };
 
   const approveUser = (userId: string) => {
     const targetUser = users.find((u) => u.id === userId);
-    setUsers((prev) =>
-      prev.map((u) => (u.id === userId ? { ...u, statusAprovacao: 'aprovado', active: true } : u))
-    );
+    const updatedUsers = users.map((u) => (u.id === userId ? { ...u, statusAprovacao: 'aprovado' as const, active: true } : u));
+    setUsers(updatedUsers);
     logAction(
       'Aprovação de Corretor',
       'Gestão de Usuários',
@@ -917,43 +1055,45 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       destinatarioUserId: userId,
       linkTab: 'dashboard',
     });
+    persistFullStateDirectly({ users: updatedUsers });
   };
 
   const rejectUser = (userId: string) => {
     const targetUser = users.find((u) => u.id === userId);
-    setUsers((prev) =>
-      prev.map((u) => (u.id === userId ? { ...u, statusAprovacao: 'rejeitado', active: false } : u))
-    );
+    const updatedUsers = users.map((u) => (u.id === userId ? { ...u, statusAprovacao: 'rejeitado' as const, active: false } : u));
+    setUsers(updatedUsers);
     logAction(
       'Rejeição de Corretor',
       'Gestão de Usuários',
       `O Administrador rejeitou a solicitação de cadastro do corretor "${targetUser?.name || userId}".`
     );
+    persistFullStateDirectly({ users: updatedUsers });
   };
 
   const updateUser = (userId: string, updates: Partial<User>) => {
-    setUsers((prev) =>
-      prev.map((u) => {
-        if (u.id === userId) {
-          const updated = { ...u, ...updates };
-          logAction(
-            'Atualização de Usuário',
-            'Gestão de Usuários',
-            `Dados do usuário ${u.name} atualizados.`
-          );
-          if (currentUser.id === userId) {
-            setCurrentUser(updated);
-          }
-          return updated;
+    const updatedUsers = users.map((u) => {
+      if (u.id === userId) {
+        const updated = { ...u, ...updates };
+        logAction(
+          'Atualização de Usuário',
+          'Gestão de Usuários',
+          `Dados do usuário ${u.name} atualizados.`
+        );
+        if (currentUser.id === userId) {
+          setCurrentUser(updated);
         }
-        return u;
-      })
-    );
+        return updated;
+      }
+      return u;
+    });
+    setUsers(updatedUsers);
+    persistFullStateDirectly({ users: updatedUsers });
   };
 
-  const deleteUser = (userId: string) => {
+  const deleteUser = (userId: string, motivo?: string) => {
     if (currentUser.role !== 'admin') {
-      alert('Apenas o Administrador pode excluir usuários e líderes do sistema.');
+      alert('Acesso negado: Apenas usuários com perfil Administrador podem excluir corretores e usuários do sistema.');
+      logAction('Tentativa de Exclusão Bloqueada', 'Segurança', `Usuário ${currentUser.name} (${currentUser.role}) tentou excluir usuário ID ${userId} sem autorização.`);
       return;
     }
     const target = users.find((u) => u.id === userId);
@@ -962,12 +1102,67 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       alert('Não é possível excluir o usuário que está conectado no momento!');
       return;
     }
-    setUsers((prev) => prev.filter((u) => u.id !== userId));
-    logAction(
-      'Exclusão de Usuário',
-      'Gestão de Usuários',
-      `Usuário ${target.name} (${target.role.toUpperCase()}) foi removido do sistema.`
+
+    // Register into persistent deletedUserIds set
+    deletedUserIdsRef.current.add(userId);
+    try {
+      localStorage.setItem('jv_deleted_user_ids', JSON.stringify(Array.from(deletedUserIdsRef.current)));
+    } catch {
+      // ignore
+    }
+
+    // 1. Remove user from users list
+    const updatedUsers = users.filter((u) => u.id !== userId);
+
+    // 2. Cascade cleanup from all teams (both as leader and as member)
+    const updatedTeams = teams.map((team) => {
+      const isLeader = team.leaderId === userId;
+      const isMember = (team.memberIds || []).includes(userId);
+      if (!isLeader && !isMember) return team;
+      return {
+        ...team,
+        leaderId: isLeader ? '' : team.leaderId,
+        leaderName: isLeader ? 'Líder Não Definido' : team.leaderName,
+        memberIds: (team.memberIds || []).filter((id) => id !== userId),
+      };
+    });
+
+    // 3. Cascade cleanup from shift scales
+    const updatedScales = scales.map((s) => ({
+      ...s,
+      corretorIds: (s.corretorIds || []).filter((id) => id !== userId),
+    }));
+
+    // 4. Cascade cleanup from shift attendances
+    const updatedAttendances = attendances.filter((a) => a.corretorId !== userId);
+
+    // 5. Cascade cleanup from roulette history
+    const updatedRouletteHistory = rouletteHistory.filter((r) => r.corretorId !== userId);
+
+    // Update React states immediately
+    setUsers(updatedUsers);
+    setTeams(updatedTeams);
+    setScales(updatedScales);
+    setAttendances(updatedAttendances);
+    setRouletteHistory(updatedRouletteHistory);
+
+    recordDeletionAudit(
+      'usuario_corretor',
+      target.id,
+      `${target.name} (${target.role.toUpperCase()} - CRECI: ${target.creci || 'S/N'})`,
+      `Usuário/corretor ${target.name} (${target.email}) removido definitivamente pelo Administrador.`,
+      target,
+      motivo || 'Exclusão definitiva de usuário pelo Administrador'
     );
+
+    // Synchronously and permanently persist to LocalStorage and Firestore Cloud immediately
+    persistFullStateDirectly({
+      users: updatedUsers,
+      teams: updatedTeams,
+      scales: updatedScales,
+      attendances: updatedAttendances,
+      rouletteHistory: updatedRouletteHistory,
+    });
   };
 
   // Tags Management CRUD
@@ -994,29 +1189,33 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       borderClass: tagData.borderClass || c.border,
     };
 
-    setTags((prev) => [...prev, newTag]);
+    const currentTags = stateRef.current.tags || [];
+    const updatedTags = [...currentTags, newTag];
     logAction('Nova Tag Cadastrada', 'Cadastro de Tags', `Tag "${newTag.nome}" criada na categoria ${newTag.categoria}.`);
+    updateAndPersist({ tags: updatedTags });
     return newTag;
   };
 
   const updateTag = (tagId: string, updates: Partial<TagItem>) => {
-    setTags((prev) =>
-      prev.map((t) => {
-        if (t.id === tagId) {
-          const updated = { ...t, ...updates };
-          logAction('Tag Atualizada', 'Cadastro de Tags', `Tag "${t.nome}" atualizada.`);
-          return updated;
-        }
-        return t;
-      })
-    );
+    const currentTags = stateRef.current.tags || [];
+    const updatedTags = currentTags.map((t) => {
+      if (t.id === tagId) {
+        const updated = { ...t, ...updates };
+        logAction('Tag Atualizada', 'Cadastro de Tags', `Tag "${t.nome}" atualizada.`);
+        return updated;
+      }
+      return t;
+    });
+    updateAndPersist({ tags: updatedTags });
   };
 
   const deleteTag = (tagId: string) => {
-    const target = tags.find((t) => t.id === tagId);
+    const currentTags = stateRef.current.tags || [];
+    const target = currentTags.find((t) => t.id === tagId);
     if (!target) return;
-    setTags((prev) => prev.filter((t) => t.id !== tagId));
+    const updatedTags = currentTags.filter((t) => t.id !== tagId);
     logAction('Tag Excluída', 'Cadastro de Tags', `Tag "${target.nome}" foi removida do sistema.`);
+    updateAndPersist({ tags: updatedTags });
   };
 
   // Simulator Policy Rules CRUD
@@ -1277,8 +1476,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     clienteNome?: string,
     corretorNome?: string
   ) => {
-    setUnits((prev) =>
-      prev.map((u) => {
+    let updatedUnits: Unit[] = [];
+    setUnits((prev) => {
+      updatedUnits = prev.map((u) => {
         if (u.id === unitId) {
           const updated = {
             ...u,
@@ -1295,16 +1495,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           return updated;
         }
         return u;
-      })
-    );
+      });
+      return updatedUnits;
+    });
+    persistFullStateDirectly({ units: updatedUnits });
   };
 
   const reserveUnitForLead = (unitId: string, leadId: string, leadNome: string) => {
     const now = new Date();
     const expiracao = new Date(now.getTime() + 72 * 3600 * 1000).toISOString();
+    let updatedUnits: Unit[] = [];
 
-    setUnits((prev) =>
-      prev.map((u) => {
+    setUnits((prev) => {
+      updatedUnits = prev.map((u) => {
         if (u.id === unitId) {
           return {
             ...u,
@@ -1321,8 +1524,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           };
         }
         return u;
-      })
-    );
+      });
+      return updatedUnits;
+    });
 
     const lead = leads.find((l) => l.id === leadId);
     if (lead) {
@@ -1339,14 +1543,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       'Espelho de Vendas',
       `Unidade ${unitId} reservada por ${currentUser.name} para ${leadNome}. Prazo de 72h para comprovante do ato.`
     );
+
+    persistFullStateDirectly({ units: updatedUnits });
   };
 
   const transformReservationToPreSale = (unitId: string) => {
     const targetUnit = units.find((u) => u.id === unitId);
     if (!targetUnit) return;
+    let updatedUnits: Unit[] = [];
 
-    setUnits((prev) =>
-      prev.map((u) => {
+    setUnits((prev) => {
+      updatedUnits = prev.map((u) => {
         if (u.id === unitId) {
           return {
             ...u,
@@ -1354,8 +1561,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           };
         }
         return u;
-      })
-    );
+      });
+      return updatedUnits;
+    });
 
     if (targetUnit.reservaLeadId) {
       updateLeadStatus(targetUnit.reservaLeadId, 'doc_coletada');
@@ -1372,6 +1580,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       'Espelho de Vendas',
       `Unidade ${targetUnit.identificacao || targetUnit.lote} convertida de Reserva para Pré-Venda.`
     );
+
+    persistFullStateDirectly({ units: updatedUnits });
   };
 
   const addUnit = (unitData: Omit<Unit, 'id'>): Unit => {
@@ -1379,28 +1589,41 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       ...unitData,
       id: `unit-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
     };
-    setUnits((prev) => [newUnit, ...prev]);
+    const updatedUnits = [newUnit, ...units];
+    setUnits(updatedUnits);
     logAction('Adição de Nova Unidade', 'Tabela de Vendas', `Unidade ${newUnit.quadra} - ${newUnit.lote} adicionada.`);
+    persistFullStateDirectly({ units: updatedUnits });
     return newUnit;
   };
 
   const updateUnit = (unitId: string, updates: Partial<Unit>) => {
-    setUnits((prev) =>
-      prev.map((u) => (u.id === unitId ? { ...u, ...updates } : u))
-    );
+    let updatedUnits: Unit[] = [];
+    setUnits((prev) => {
+      updatedUnits = prev.map((u) => (u.id === unitId ? { ...u, ...updates } : u));
+      return updatedUnits;
+    });
     logAction('Edição de Unidade', 'Tabela de Vendas', `Unidade ${unitId} atualizada.`);
+    persistFullStateDirectly({ units: updatedUnits });
   };
 
   const deleteUnit = (unitId: string) => {
     if (currentUser.role !== 'admin') {
-      alert('Apenas o Administrador pode excluir unidades do espelho de vendas.');
+      alert('Acesso negado: Apenas usuários com perfil Administrador podem excluir unidades do espelho de vendas.');
+      logAction('Tentativa de Exclusão Bloqueada', 'Segurança', `Usuário ${currentUser.name} (${currentUser.role}) tentou excluir unidade ${unitId} sem permissão.`);
       return;
     }
     const target = units.find((u) => u.id === unitId);
-    setUnits((prev) => prev.filter((u) => u.id !== unitId));
-    if (target) {
-      logAction('Exclusão de Unidade', 'Espelho de Vendas', `Unidade ${target.quadra} - ${target.lote} foi removida.`);
-    }
+    if (!target) return;
+    const updatedUnits = units.filter((u) => u.id !== unitId);
+    setUnits(updatedUnits);
+    recordDeletionAudit(
+      'imovel_unidade',
+      target.id,
+      `Unidade ${target.quadra} - ${target.lote} (${target.tipoUnidade || 'Lote Padrão'})`,
+      `Unidade ${target.quadra} - ${target.lote} (Valor R$ ${target.valorFinal?.toLocaleString('pt-BR') || 0}) excluída do espelho de vendas.`,
+      target
+    );
+    persistFullStateDirectly({ units: updatedUnits });
   };
 
   const getUnitById = (unitId: string) => units.find((u) => u.id === unitId);
@@ -1554,7 +1777,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       logAction('Novo Cadastro de Cliente', 'CRM / Leads', `Cliente ${newLead.nome} (${newLead.codigoExterno}) cadastrado por ${newLead.corretorNome}.`);
     }
 
-    setLeads((prev) => [newLead, ...prev]);
+    const updatedLeads = [newLead, ...leads];
+    setLeads(updatedLeads);
+    persistFullStateDirectly({ leads: updatedLeads });
 
     // Send a targeted notification to the assigned broker if it's assigned to someone else
     if (leadData.corretorId && leadData.corretorId !== currentUser.id) {
@@ -1587,41 +1812,41 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const updateLead = (leadId: string, updates: Partial<Lead>) => {
-    setLeads((prev) =>
-      prev.map((lead) => {
-        if (lead.id === leadId) {
-          const updated = {
-            ...lead,
-            ...updates,
-            dataAtualizacao: new Date().toISOString().split('T')[0],
-          };
-          logAction('Atualização de Lead', 'CRM / Leads', `Dados de ${lead.nome} atualizados por ${currentUser.name}.`);
-          return updated;
-        }
-        return lead;
-      })
-    );
+    const updatedLeads = leads.map((lead) => {
+      if (lead.id === leadId) {
+        const updated = {
+          ...lead,
+          ...updates,
+          dataAtualizacao: new Date().toISOString().split('T')[0],
+        };
+        logAction('Atualização de Lead', 'CRM / Leads', `Dados de ${lead.nome} atualizados por ${currentUser.name}.`);
+        return updated;
+      }
+      return lead;
+    });
+    setLeads(updatedLeads);
+    persistFullStateDirectly({ leads: updatedLeads });
   };
 
   const updateLeadStatus = (leadId: string, newStatus: FunnelStage) => {
-    setLeads((prev) =>
-      prev.map((lead) => {
-        if (lead.id === leadId) {
-          const updated = {
-            ...lead,
-            status: newStatus,
-            dataAtualizacao: new Date().toISOString().split('T')[0],
-          };
-          logAction(
-            'Movimentação no Funil (Kanban)',
-            'CRM / Funil',
-            `Lead ${lead.nome} movido para a etapa: ${newStatus.replace('_', ' ').toUpperCase()}.`
-          );
-          return updated;
-        }
-        return lead;
-      })
-    );
+    const updatedLeads = leads.map((lead) => {
+      if (lead.id === leadId) {
+        const updated = {
+          ...lead,
+          status: newStatus,
+          dataAtualizacao: new Date().toISOString().split('T')[0],
+        };
+        logAction(
+          'Movimentação no Funil (Kanban)',
+          'CRM / Funil',
+          `Lead ${lead.nome} movido para a etapa: ${newStatus.replace('_', ' ').toUpperCase()}.`
+        );
+        return updated;
+      }
+      return lead;
+    });
+    setLeads(updatedLeads);
+    persistFullStateDirectly({ leads: updatedLeads });
   };
 
   const addLeadNote = (leadId: string, texto: string) => {
@@ -1636,18 +1861,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       texto,
     };
 
-    setLeads((prev) =>
-      prev.map((lead) => {
-        if (lead.id === leadId) {
-          return {
-            ...lead,
-            notas: [newNote, ...lead.notas],
-            dataAtualizacao: new Date().toISOString().split('T')[0],
-          };
-        }
-        return lead;
-      })
-    );
+    const updatedLeads = leads.map((lead) => {
+      if (lead.id === leadId) {
+        return {
+          ...lead,
+          notas: [newNote, ...lead.notas],
+          dataAtualizacao: new Date().toISOString().split('T')[0],
+        };
+      }
+      return lead;
+    });
+    setLeads(updatedLeads);
+    persistFullStateDirectly({ leads: updatedLeads });
     logAction('Nova Nota / Interação', 'CRM / Leads', `Nota adicionada ao lead ${leadId}.`);
   };
 
@@ -1678,19 +1903,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       assuntoCorretor: isBrokerSubject,
     };
 
-    setLeads((prev) =>
-      prev.map((lead) => {
-        if (lead.id === leadId) {
-          const currentActivities = lead.atividades || [];
-          return {
-            ...lead,
-            atividades: [...currentActivities, newActivity],
-            dataAtualizacao: new Date().toISOString().split('T')[0],
-          };
-        }
-        return lead;
-      })
-    );
+    const updatedLeads = leads.map((lead) => {
+      if (lead.id === leadId) {
+        const currentActivities = lead.atividades || [];
+        return {
+          ...lead,
+          atividades: [...currentActivities, newActivity],
+          dataAtualizacao: new Date().toISOString().split('T')[0],
+        };
+      }
+      return lead;
+    });
+    setLeads(updatedLeads);
+    persistFullStateDirectly({ leads: updatedLeads });
 
     // If broker subject detected, trigger flashing alert and notification to Leader and Admin
     if (isBrokerSubject && targetLead) {
@@ -1920,10 +2145,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     deleteLeadWithAudit(leadId, 'Exclusão direta via sistema');
   };
 
-  // Deletion with Audit Protocol (Admin & Gestor only)
+  // Deletion with Audit Protocol (Admin only)
   const deleteLeadWithAudit = (leadId: string, motivo: string): string => {
     if (currentUser.role !== 'admin') {
-      alert('Apenas o Administrador pode excluir clientes/leads do sistema.');
+      alert('Acesso negado: Apenas o Administrador pode excluir cadastros de clientes/leads do sistema.');
+      logAction('Tentativa de Exclusão Bloqueada', 'Segurança', `Usuário ${currentUser.name} (${currentUser.role}) tentou excluir o cliente ID ${leadId} sem autorização.`);
       return '';
     }
     const lead = leads.find((l) => l.id === leadId);
@@ -1949,18 +2175,29 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       excluidoPorId: currentUser.id,
       excluidoPorNome: currentUser.name,
       excluidoPorRole: currentUser.role,
-      motivoExclusao: motivo || 'Exclusão solicitada pela gestão',
+      motivoExclusao: motivo || 'Exclusão solicitada pela administração',
       dadosSnapshot: lead,
     };
 
-    setDeletedLeads((prev) => [deletedRecord, ...prev]);
-    setLeads((prev) => prev.filter((l) => l.id !== leadId));
+    const updatedDeletedLeads = [deletedRecord, ...deletedLeads];
+    const updatedLeads = leads.filter((l) => l.id !== leadId);
 
-    logAction(
-      'Exclusão de Lead com Protocolo',
-      'Auditoria / Exclusões',
-      `Lead ${lead.nome} (${lead.telefone}) excluído por ${currentUser.name}. Protocolo: ${protocol}. Motivo: ${motivo}`
+    setDeletedLeads(updatedDeletedLeads);
+    setLeads(updatedLeads);
+
+    recordDeletionAudit(
+      'cliente_lead',
+      lead.id,
+      `${lead.nome} (CPF: ${lead.cpf || 'Não informado'} | Tel: ${lead.telefone})`,
+      `Cliente ${lead.nome} (Corretor: ${lead.corretorNome || 'Sem corretor'}, Equipe: ${team?.name || 'Sem equipe'}) excluído do CRM. Motivo: ${motivo}`,
+      lead,
+      motivo
     );
+
+    persistFullStateDirectly({
+      leads: updatedLeads,
+      deletedLeads: updatedDeletedLeads,
+    });
 
     return protocol;
   };
@@ -1971,21 +2208,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       ...ruleData,
       id: `rule-${Date.now()}`,
     };
-    setShiftRules((prev) => [...prev, newRule]);
+    const updatedRules = [...shiftRules, newRule];
+    setShiftRules(updatedRules);
+    persistFullStateDirectly({ shiftRules: updatedRules });
     logAction('Nova Regra de Plantão', 'Regras do Plantão', `Regra #${newRule.numero} (${newRule.titulo}) criada.`);
   };
 
   const updateShiftRule = (ruleId: string, updates: Partial<ShiftRule>) => {
-    setShiftRules((prev) =>
-      prev.map((r) => (r.id === ruleId ? { ...r, ...updates } : r))
-    );
+    const updatedRules = shiftRules.map((r) => (r.id === ruleId ? { ...r, ...updates } : r));
+    setShiftRules(updatedRules);
+    persistFullStateDirectly({ shiftRules: updatedRules });
     logAction('Edição de Regra de Plantão', 'Regras do Plantão', `Regra ${ruleId} atualizada.`);
   };
 
   const toggleShiftRule = (ruleId: string) => {
-    setShiftRules((prev) =>
-      prev.map((r) => (r.id === ruleId ? { ...r, ativo: !r.ativo } : r))
-    );
+    const updatedRules = shiftRules.map((r) => (r.id === ruleId ? { ...r, ativo: !r.ativo } : r));
+    setShiftRules(updatedRules);
+    persistFullStateDirectly({ shiftRules: updatedRules });
   };
 
   const updateShiftRulesText = (novoTexto: string) => {
@@ -2003,7 +2242,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       id: `visit-${Date.now()}`,
       dataHora: formatted,
     };
-    setVisits((prev) => [newVisit, ...prev]);
+    const updatedVisits = [newVisit, ...visits];
+    setVisits(updatedVisits);
+    persistFullStateDirectly({ visits: updatedVisits });
     logAction(
       'Registro de Visita no Plantão',
       'Recepção / Visitas',
@@ -2018,28 +2259,32 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       id: `task-${Date.now()}`,
       concluida: false,
     };
-    setTasks((prev) => [newTask, ...prev]);
+    const updatedTasks = [newTask, ...tasks];
+    setTasks(updatedTasks);
+    persistFullStateDirectly({ tasks: updatedTasks });
     logAction('Nova Tarefa Criada', 'Tarefas', `Tarefa "${newTask.titulo}" atribuída para ${newTask.corretorNome}.`);
   };
 
   const toggleTask = (taskId: string) => {
-    setTasks((prev) =>
-      prev.map((task) => {
-        if (task.id === taskId) {
-          const nextState = !task.concluida;
-          return {
-            ...task,
-            concluida: nextState,
-            dataConclusao: nextState ? new Date().toISOString().split('T')[0] : undefined,
-          };
-        }
-        return task;
-      })
-    );
+    const updatedTasks = tasks.map((task) => {
+      if (task.id === taskId) {
+        const nextState = !task.concluida;
+        return {
+          ...task,
+          concluida: nextState,
+          dataConclusao: nextState ? new Date().toISOString().split('T')[0] : undefined,
+        };
+      }
+      return task;
+    });
+    setTasks(updatedTasks);
+    persistFullStateDirectly({ tasks: updatedTasks });
   };
 
   const deleteTask = (taskId: string) => {
-    setTasks((prev) => prev.filter((t) => t.id !== taskId));
+    const updatedTasks = tasks.filter((t) => t.id !== taskId);
+    setTasks(updatedTasks);
+    persistFullStateDirectly({ tasks: updatedTasks });
   };
 
   // Scales & Shifts
@@ -2048,7 +2293,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       ...scaleData,
       id: `scale-${Date.now()}`,
     };
-    setScales((prev) => [...prev, newScale]);
+    const updatedScales = [...scales, newScale];
+    setScales(updatedScales);
+    persistFullStateDirectly({ scales: updatedScales });
     logAction('Nova Escala de Plantão', 'Plantão / Escalas', `Escala do dia ${newScale.data} (${newScale.turno}) criada.`);
 
     // Send notifications to each assigned broker
@@ -2295,15 +2542,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const deleteCommission = (commissionId: string) => {
-    const target = commissions.find((c) => c.id === commissionId);
-    setCommissions((prev) => prev.filter((comm) => comm.id !== commissionId));
-    if (target) {
-      logAction(
-        'Comissão Excluída',
-        'Financeiro / Comissões',
-        `Comissão ${target.unidadeIdentificacao} excluída do financeiro.`
-      );
+    if (currentUser.role !== 'admin') {
+      alert('Acesso negado: Apenas administradores podem excluir registros de comissões.');
+      logAction('Tentativa de Exclusão Bloqueada', 'Segurança', `Usuário ${currentUser.name} tentou excluir comissão ID ${commissionId} sem permissão.`);
+      return;
     }
+    const target = commissions.find((c) => c.id === commissionId);
+    if (!target) return;
+    setCommissions((prev) => prev.filter((comm) => comm.id !== commissionId));
+    recordDeletionAudit(
+      'comissao',
+      target.id,
+      `Comissão Unidade ${target.unidadeIdentificacao} (Corretor: ${target.corretorNome})`,
+      `Comissão de R$ ${target.valorComissaoCorretor?.toLocaleString('pt-BR') || 0} removida do financeiro pelo Administrador.`,
+      target
+    );
   };
 
   const updateCommissionStatus = (commissionId: string, status: Commission['status']) => {
@@ -2396,78 +2649,114 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       unidadesVendidas: teamData.unidadesVendidas || 0,
       metaUnidades: teamData.metaUnidades || 10,
     };
-    setTeams((prev) => [...prev, newTeam]);
+    const updatedTeams = [...teams, newTeam];
 
     // Synchronize leader and members teamId
-    setUsers((prev) =>
-      prev.map((u) => {
-        if (newTeam.leaderId && u.id === newTeam.leaderId) {
-          return { ...u, teamId: newTeamId };
-        }
-        if (newTeam.memberIds.includes(u.id)) {
-          return { ...u, teamId: newTeamId };
-        }
-        return u;
-      })
-    );
+    const updatedUsers = users.map((u) => {
+      if (newTeam.leaderId && u.id === newTeam.leaderId) {
+        return { ...u, teamId: newTeamId };
+      }
+      if (newTeam.memberIds.includes(u.id)) {
+        return { ...u, teamId: newTeamId };
+      }
+      return u;
+    });
+
+    setTeams(updatedTeams);
+    setUsers(updatedUsers);
 
     logAction('Nova Equipe Criada', 'Gestão de Equipes', `Equipe "${newTeam.name}" cadastrada com Gestor: ${newTeam.leaderName || 'N/A'}.`);
+
+    persistFullStateDirectly({
+      teams: updatedTeams,
+      users: updatedUsers,
+    });
+
     return newTeam;
   };
 
   const updateTeam = (teamId: string, updates: Partial<Team>) => {
-    setTeams((prev) =>
-      prev.map((t) => {
-        if (t.id === teamId) {
-          const updated = { ...t, ...updates };
-          logAction(
-            'Atualização de Equipe',
-            'Gestão de Equipes',
-            `Equipe "${updated.name}" atualizada (Gestor: ${updated.leaderName || 'N/A'}).`
-          );
-          return updated;
-        }
-        return t;
-      })
-    );
+    const updatedTeams = teams.map((t) => {
+      if (t.id === teamId) {
+        const updated = { ...t, ...updates };
+        logAction(
+          'Atualização de Equipe',
+          'Gestão de Equipes',
+          `Equipe "${updated.name}" atualizada (Gestor: ${updated.leaderName || 'N/A'}).`
+        );
+        return updated;
+      }
+      return t;
+    });
 
+    let updatedUsers = users;
     if (updates.leaderId !== undefined || updates.memberIds !== undefined) {
-      setUsers((prev) =>
-        prev.map((u) => {
-          if (updates.leaderId && u.id === updates.leaderId) {
-            return { ...u, teamId };
+      const currentTeam = teams.find((t) => t.id === teamId);
+      const prevLeaderId = currentTeam?.leaderId;
+      const newLeaderId = updates.leaderId;
+
+      updatedUsers = users.map((u) => {
+        // If leader changed or cleared
+        if (prevLeaderId && u.id === prevLeaderId && newLeaderId !== prevLeaderId) {
+          const stillInMembers = updates.memberIds ? updates.memberIds.includes(u.id) : (currentTeam?.memberIds || []).includes(u.id);
+          if (!stillInMembers && u.teamId === teamId) {
+            return { ...u, teamId: '' };
           }
-          if (updates.memberIds && updates.memberIds.includes(u.id)) {
-            return { ...u, teamId };
-          }
-          return u;
-        })
-      );
+        }
+        if (newLeaderId && u.id === newLeaderId) {
+          return { ...u, teamId };
+        }
+        if (updates.memberIds && updates.memberIds.includes(u.id)) {
+          return { ...u, teamId };
+        }
+        return u;
+      });
     }
+
+    setTeams(updatedTeams);
+    setUsers(updatedUsers);
+
+    persistFullStateDirectly({
+      teams: updatedTeams,
+      users: updatedUsers,
+    });
   };
 
   const deleteTeam = (teamId: string) => {
+    if (currentUser.role !== 'admin') {
+      alert('Acesso negado: Apenas administradores podem excluir equipes.');
+      logAction('Tentativa de Exclusão Bloqueada', 'Segurança', `Usuário ${currentUser.name} tentou excluir a equipe ID ${teamId} sem permissão.`);
+      return;
+    }
     const target = teams.find((t) => t.id === teamId);
     if (!target) return;
 
     // Remove team
-    setTeams((prev) => prev.filter((t) => t.id !== teamId));
+    const updatedTeams = teams.filter((t) => t.id !== teamId);
 
     // Release all members and leader from this team
-    setUsers((prev) =>
-      prev.map((u) => {
-        if (u.teamId === teamId) {
-          return { ...u, teamId: '' };
-        }
-        return u;
-      })
+    const updatedUsers = users.map((u) => {
+      if (u.teamId === teamId) {
+        return { ...u, teamId: '' };
+      }
+      return u;
+    });
+
+    setTeams(updatedTeams);
+    setUsers(updatedUsers);
+
+    recordDeletionAudit(
+      'equipe',
+      target.id,
+      `Equipe: ${target.name} (Líder: ${target.leaderName})`,
+      `Equipe "${target.name}" foi excluída e seus membros foram desvinculados pelo Administrador.`,
+      target
     );
 
-    logAction(
-      'Exclusão de Equipe',
-      'Gestão de Equipes',
-      `Equipe "${target.name}" foi excluída inteiramente. Todos os corretores vinculados foram desvinculados com segurança.`
-    );
+    persistFullStateDirectly({
+      teams: updatedTeams,
+      users: updatedUsers,
+    });
   };
 
   const addMemberToTeam = (teamId: string, userId: string) => {
@@ -2475,54 +2764,125 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const targetTeam = teams.find((t) => t.id === teamId);
     if (!targetTeam || !targetUser) return;
 
-    setTeams((prev) =>
-      prev.map((t) => {
-        if (t.id === teamId) {
-          const currentMembers = t.memberIds || [];
-          if (!currentMembers.includes(userId)) {
-            return { ...t, memberIds: [...currentMembers, userId] };
-          }
+    const updatedTeams = teams.map((t) => {
+      if (t.id === teamId) {
+        const currentMembers = t.memberIds || [];
+        if (!currentMembers.includes(userId)) {
+          return { ...t, memberIds: [...currentMembers, userId] };
         }
-        return {
-          ...t,
-          memberIds: (t.memberIds || []).filter((mId) => (t.id === teamId ? true : mId !== userId)),
-        };
-      })
-    );
+      }
+      return {
+        ...t,
+        memberIds: (t.memberIds || []).filter((mId) => (t.id === teamId ? true : mId !== userId)),
+      };
+    });
 
-    setUsers((prev) =>
-      prev.map((u) => (u.id === userId ? { ...u, teamId } : u))
-    );
+    const updatedUsers = users.map((u) => (u.id === userId ? { ...u, teamId } : u));
+
+    setTeams(updatedTeams);
+    setUsers(updatedUsers);
 
     logAction(
       'Vínculo de Corretor',
       'Gestão de Equipes',
       `Corretor "${targetUser.name}" vinculado à equipe "${targetTeam.name}".`
     );
+
+    persistFullStateDirectly({
+      teams: updatedTeams,
+      users: updatedUsers,
+    });
   };
 
   const removeMemberFromTeam = (teamId: string, userId: string) => {
     const targetUser = users.find((u) => u.id === userId);
     const targetTeam = teams.find((t) => t.id === teamId);
 
-    setTeams((prev) =>
-      prev.map((t) => {
-        if (t.id === teamId) {
-          return { ...t, memberIds: (t.memberIds || []).filter((id) => id !== userId) };
-        }
-        return t;
-      })
-    );
+    const updatedTeams = teams.map((t) => {
+      if (t.id === teamId) {
+        const isLeader = t.leaderId === userId;
+        return {
+          ...t,
+          leaderId: isLeader ? '' : t.leaderId,
+          leaderName: isLeader ? 'Líder Não Definido' : t.leaderName,
+          memberIds: (t.memberIds || []).filter((id) => id !== userId),
+        };
+      }
+      return t;
+    });
 
-    setUsers((prev) =>
-      prev.map((u) => (u.id === userId ? { ...u, teamId: '' } : u))
-    );
+    const updatedUsers = users.map((u) => (u.id === userId ? { ...u, teamId: '' } : u));
+
+    setTeams(updatedTeams);
+    setUsers(updatedUsers);
 
     logAction(
       'Desvinculação de Membro',
       'Gestão de Equipes',
       `Corretor "${targetUser?.name || userId}" desvinculado da equipe "${targetTeam?.name || teamId}".`
     );
+
+    persistFullStateDirectly({
+      teams: updatedTeams,
+      users: updatedUsers,
+    });
+  };
+
+  const removeLeaderFromTeam = (teamId: string, deletePermanently: boolean = false, motivo?: string) => {
+    const targetTeam = teams.find((t) => t.id === teamId);
+    if (!targetTeam) return;
+
+    const leaderId = targetTeam.leaderId;
+    const leaderUser = users.find((u) => u.id === leaderId);
+
+    if (deletePermanently && leaderId) {
+      deleteUser(leaderId, motivo || `Líder removido e excluído definitivamente da equipe ${targetTeam.name}.`);
+      return;
+    }
+
+    const updatedTeams = teams.map((t) => {
+      if (t.id === teamId) {
+        return {
+          ...t,
+          leaderId: '',
+          leaderName: 'Líder Não Definido',
+          memberIds: (t.memberIds || []).filter((id) => id !== leaderId),
+        };
+      }
+      return t;
+    });
+
+    const updatedUsers = users.map((u) => {
+      if (u.id === leaderId && u.teamId === teamId) {
+        return { ...u, teamId: '' };
+      }
+      return u;
+    });
+
+    setTeams(updatedTeams);
+    setUsers(updatedUsers);
+
+    if (leaderId) {
+      recordDeletionAudit(
+        'usuario_corretor',
+        leaderId,
+        `Liderança da Equipe: ${targetTeam.name}`,
+        `Líder ${targetTeam.leaderName} foi desvinculado da liderança da equipe "${targetTeam.name}".`,
+        { team: targetTeam, leaderUser },
+        motivo || 'Desvinculação de liderança pelo Administrador'
+      );
+    }
+
+    logAction(
+      'Desvinculação de Liderança',
+      'Gestão de Equipes',
+      `Liderança da equipe "${targetTeam.name}" desvinculada (Líder anterior: ${targetTeam.leaderName || 'N/A'}).`
+    );
+
+    persistFullStateDirectly({
+      teams: updatedTeams,
+      users: updatedUsers,
+    });
   };
 
   const addPartnerAgency = (agency: Omit<PartnerAgency, 'id'>) => {
@@ -2530,18 +2890,37 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       id: `pagency-${Date.now()}`,
       ...agency,
     };
-    setPartnerAgencies(prev => [newAg, ...prev]);
+    const updatedAgencies = [newAg, ...partnerAgencies];
+    setPartnerAgencies(updatedAgencies);
+    persistFullStateDirectly({ partnerAgencies: updatedAgencies });
     logAction('Cadastro', 'Imobiliária Parceira', `Cadastrou imobiliária ${newAg.nomeImobiliaria}`);
   };
 
   const updatePartnerAgency = (agencyId: string, data: Partial<PartnerAgency>) => {
-    setPartnerAgencies(prev => prev.map(a => a.id === agencyId ? { ...a, ...data } : a));
+    const updatedAgencies = partnerAgencies.map(a => a.id === agencyId ? { ...a, ...data } : a);
+    setPartnerAgencies(updatedAgencies);
+    persistFullStateDirectly({ partnerAgencies: updatedAgencies });
     logAction('Atualização', 'Imobiliária Parceira', `Atualizou imobiliária ID ${agencyId}`);
   };
 
   const deletePartnerAgency = (agencyId: string) => {
-    setPartnerAgencies(prev => prev.filter(a => a.id !== agencyId));
-    logAction('Exclusão', 'Imobiliária Parceira', `Removeu imobiliária ID ${agencyId}`);
+    if (currentUser.role !== 'admin') {
+      alert('Acesso negado: Apenas administradores podem excluir imobiliárias parceiras.');
+      logAction('Tentativa de Exclusão Bloqueada', 'Segurança', `Usuário ${currentUser.name} tentou excluir imobiliária ID ${agencyId} sem autorização.`);
+      return;
+    }
+    const target = partnerAgencies.find(a => a.id === agencyId);
+    if (!target) return;
+    const updatedAgencies = partnerAgencies.filter(a => a.id !== agencyId);
+    setPartnerAgencies(updatedAgencies);
+    persistFullStateDirectly({ partnerAgencies: updatedAgencies });
+    recordDeletionAudit(
+      'outros',
+      target.id,
+      `Imobiliária Parceira: ${target.nomeImobiliaria}`,
+      `Imobiliária parceira ${target.nomeImobiliaria} excluída pelo Administrador.`,
+      target
+    );
   };
 
   const addPartnerVisit = (visit: Omit<PartnerVisitAttendance, 'id'>) => {
@@ -2549,18 +2928,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       id: `pvisit-${Date.now()}`,
       ...visit,
     };
-    setPartnerVisits(prev => [newV, ...prev]);
+    const updatedPartnerVisits = [newV, ...partnerVisits];
+    setPartnerVisits(updatedPartnerVisits);
+    persistFullStateDirectly({ partnerVisits: updatedPartnerVisits });
     logAction('Cadastro', 'Visita Imobiliária Parceira', `Agendou visita para cliente ${newV.clientName} (${newV.agencyName})`);
   };
 
   const updatePartnerVisit = (visitId: string, data: Partial<PartnerVisitAttendance>) => {
-    setPartnerVisits(prev => prev.map(v => v.id === visitId ? { ...v, ...data } : v));
+    const updatedPartnerVisits = partnerVisits.map(v => v.id === visitId ? { ...v, ...data } : v);
+    setPartnerVisits(updatedPartnerVisits);
+    persistFullStateDirectly({ partnerVisits: updatedPartnerVisits });
     logAction('Atualização', 'Visita Imobiliária Parceira', `Atualizou visita ID ${visitId}`);
   };
 
   const deletePartnerVisit = (visitId: string) => {
-    setPartnerVisits(prev => prev.filter(v => v.id !== visitId));
-    logAction('Exclusão', 'Visita Imobiliária Parceira', `Removeu visita ID ${visitId}`);
+    // REGRA DE AUDITORIA E COMPLIANCE: Registros de atendimentos e visitas NÃO DEVEM ser apagados.
+    console.warn(`Tentativa de exclusão do atendimento/visita ${visitId} bloqueada: registros de atendimentos são permanentes.`);
+    alert('Aviso de Conformidade: Os registros de atendimentos realizados são protegidos por auditoria e NÃO podem ser apagados do sistema.');
   };
 
   const resetPassword = (email: string, newPass: string) => {
@@ -2575,47 +2959,126 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (!targetUser) {
       return { success: false, message: 'E-mail não encontrado na base de usuários cadastrados.' };
     }
+    let updatedUsers: User[] = [];
     setUsers(prev => {
       const exists = prev.some(u => u.email.trim().toLowerCase() === cleanEmail);
       if (exists) {
-        return prev.map(u => u.email.trim().toLowerCase() === cleanEmail ? { ...u, password: newPass } : u);
+        updatedUsers = prev.map(u => u.email.trim().toLowerCase() === cleanEmail ? { ...u, password: newPass } : u);
+        return updatedUsers;
+      } else if (targetUser) {
+        updatedUsers = [...prev, { ...targetUser, password: newPass }];
+        return updatedUsers;
       }
-      return [...prev, { ...targetUser!, password: newPass }];
+      return prev;
     });
+    if (updatedUsers.length > 0) {
+      persistFullStateDirectly({ users: updatedUsers });
+    }
     logAction('Redefinição de Senha', 'Usuário', `Senha redefinida para ${targetUser.email}`);
     return { success: true, message: 'Senha redefinida com sucesso! Você já pode entrar com sua nova senha.' };
   };
 
   const deleteMultipleLeads = (leadIds: string[]) => {
     if (currentUser.role !== 'admin') {
-      alert('Apenas administradores podem excluir registros em lote.');
+      alert('Acesso negado: Apenas administradores podem excluir clientes em lote.');
+      logAction('Tentativa de Exclusão Bloqueada', 'Segurança', `Usuário ${currentUser.name} tentou excluir clientes em lote sem autorização.`);
       return;
     }
     const idSet = new Set(leadIds);
-    setLeads((prev) => prev.filter((l) => !idSet.has(l.id)));
-    logAction('Exclusão em Lote de Leads', 'Clientes', `${leadIds.length} clientes foram excluídos simultaneamente.`);
+    const targets = leads.filter((l) => idSet.has(l.id));
+    const updatedLeads = leads.filter((l) => !idSet.has(l.id));
+    setLeads(updatedLeads);
+    targets.forEach((lead) => {
+      recordDeletionAudit(
+        'cliente_lead',
+        lead.id,
+        `${lead.nome} (CPF: ${lead.cpf || 'S/N'} | Tel: ${lead.telefone})`,
+        `Exclusão em lote de clientes da base ativa.`,
+        lead,
+        'Exclusão em lote por Administrador'
+      );
+    });
+    persistFullStateDirectly({ leads: updatedLeads });
   };
 
   const deleteMultipleUnits = (unitIds: string[]) => {
     if (currentUser.role !== 'admin') {
-      alert('Apenas administradores podem excluir unidades em lote.');
+      alert('Acesso negado: Apenas administradores podem excluir unidades em lote.');
+      logAction('Tentativa de Exclusão Bloqueada', 'Segurança', `Usuário ${currentUser.name} tentou excluir unidades em lote sem autorização.`);
       return;
     }
     const idSet = new Set(unitIds);
-    setUnits((prev) => prev.filter((u) => !idSet.has(u.id)));
-    logAction('Exclusão em Lote de Unidades', 'Espelho de Vendas', `${unitIds.length} unidades do espelho foram excluídas.`);
+    const targets = units.filter((u) => idSet.has(u.id));
+    const updatedUnits = units.filter((u) => !idSet.has(u.id));
+    setUnits(updatedUnits);
+    targets.forEach((u) => {
+      recordDeletionAudit(
+        'imovel_unidade',
+        u.id,
+        `Unidade ${u.quadra} - ${u.lote}`,
+        `Exclusão em lote de unidades do espelho de vendas.`,
+        u,
+        'Exclusão em lote por Administrador'
+      );
+    });
+    persistFullStateDirectly({ units: updatedUnits });
   };
 
   const deleteMultipleUsers = (userIds: string[]) => {
     if (currentUser.role !== 'admin') {
-      alert('Apenas administradores podem remover usuários em lote.');
+      alert('Acesso negado: Apenas administradores podem remover usuários em lote.');
+      logAction('Tentativa de Exclusão Bloqueada', 'Segurança', `Usuário ${currentUser.name} tentou excluir usuários em lote sem autorização.`);
       return;
     }
     // Safeguard current connected user
     const safeUserIds = userIds.filter((id) => id !== currentUser.id);
     const idSet = new Set(safeUserIds);
-    setUsers((prev) => prev.filter((u) => !idSet.has(u.id)));
-    logAction('Exclusão em Lote de Corretores', 'Equipe', `${safeUserIds.length} corretores foram removidos do sistema.`);
+    const targets = users.filter((u) => idSet.has(u.id));
+    if (targets.length === 0) return;
+
+    const updatedUsers = users.filter((u) => !idSet.has(u.id));
+    const updatedTeams = teams.map((team) => {
+      const isLeader = idSet.has(team.leaderId);
+      const isMember = (team.memberIds || []).some((id) => idSet.has(id));
+      if (!isLeader && !isMember) return team;
+      return {
+        ...team,
+        leaderId: isLeader ? '' : team.leaderId,
+        leaderName: isLeader ? 'Líder Não Definido' : team.leaderName,
+        memberIds: (team.memberIds || []).filter((id) => !idSet.has(id)),
+      };
+    });
+    const updatedScales = scales.map((s) => ({
+      ...s,
+      corretorIds: (s.corretorIds || []).filter((id) => !idSet.has(id)),
+    }));
+    const updatedAttendances = attendances.filter((a) => !idSet.has(a.corretorId));
+    const updatedRouletteHistory = rouletteHistory.filter((r) => !idSet.has(r.corretorId));
+
+    setUsers(updatedUsers);
+    setTeams(updatedTeams);
+    setScales(updatedScales);
+    setAttendances(updatedAttendances);
+    setRouletteHistory(updatedRouletteHistory);
+
+    targets.forEach((u) => {
+      recordDeletionAudit(
+        'usuario_corretor',
+        u.id,
+        `${u.name} (${u.role.toUpperCase()} - ${u.email})`,
+        `Exclusão em lote de usuários/corretores.`,
+        u,
+        'Exclusão em lote por Administrador'
+      );
+    });
+
+    persistFullStateDirectly({
+      users: updatedUsers,
+      teams: updatedTeams,
+      scales: updatedScales,
+      attendances: updatedAttendances,
+      rouletteHistory: updatedRouletteHistory,
+    });
   };
 
   const resetCategoryData = (category: 'leads' | 'units' | 'users' | 'tasks' | 'approvals' | 'commissions' | 'all') => {
@@ -2660,6 +3123,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setPartnerVisits([]);
       logAction('RESET TOTAL DO SISTEMA', 'Base de Dados', 'A aplicação foi totalmente zerada para configuração do zero.');
     }
+
+    persistFullStateDirectly();
   };
 
   const resetToDefaults = () => {
@@ -2685,6 +3150,28 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setCurrentUser(initialUsers[0]);
     localStorage.removeItem(STORAGE_KEY);
     logAction('Reset de Fábrica', 'Sistema', 'Todas as configurações e 877 unidades foram redefinidas para o padrão.');
+
+    persistFullStateDirectly({
+      settings: initialSettings,
+      users: initialUsers,
+      teams: initialTeams,
+      units: generate877Units(),
+      leads: initialLeads,
+      visits: initialVisits,
+      tasks: initialTasks,
+      scales: initialScales,
+      attendances: initialAttendances,
+      rouletteHistory: initialRouletteHistory,
+      commissions: initialCommissions,
+      auditLogs: initialAuditLogs,
+      notifications: initialNotifications,
+      shiftRules: initialShiftRules,
+      deletedLeads: initialDeletedLeads,
+      tags: initialTags,
+      simulatorPolicyRules: initialSimulatorPolicyRules,
+      partnerAgencies: initialPartnerAgencies,
+      partnerVisits: initialPartnerVisits,
+    });
   };
 
   return (
@@ -2739,6 +3226,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         deleteTeam,
         addMemberToTeam,
         removeMemberFromTeam,
+        removeLeaderFromTeam,
         units,
         updateUnitStatus,
         reserveUnitForLead,
@@ -2802,6 +3290,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         updateCommissionStatus,
         auditLogs,
         logAction,
+        deletionLogs,
+        recordDeletionAudit,
         exportDatabaseJson,
         importDatabaseJson,
         resetToDefaults,

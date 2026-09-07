@@ -386,17 +386,19 @@ export const CommissionsView: React.FC = () => {
                   >
                     <Edit2 className="w-4 h-4" />
                   </button>
-                  <button
-                    onClick={() => {
-                      if (window.confirm(`Deseja excluir o lançamento da unidade ${c.unidadeIdentificacao}?`)) {
-                        deleteCommission(c.id);
-                      }
-                    }}
-                    className="p-1.5 rounded-lg bg-red-50 dark:bg-red-950/40 text-red-600 dark:text-red-400"
-                    title="Excluir"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
+                  {currentUser.role === 'admin' && (
+                    <button
+                      onClick={() => {
+                        if (window.confirm(`Deseja excluir o lançamento da unidade ${c.unidadeIdentificacao}?`)) {
+                          deleteCommission(c.id);
+                        }
+                      }}
+                      className="p-1.5 rounded-lg bg-red-50 dark:bg-red-950/40 text-red-600 dark:text-red-400"
+                      title="Excluir (Exclusivo Administrador)"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  )}
                 </div>
               )}
             </div>
@@ -476,17 +478,19 @@ export const CommissionsView: React.FC = () => {
                         >
                           <Edit2 className="w-3.5 h-3.5" />
                         </button>
-                        <button
-                          onClick={() => {
-                            if (window.confirm(`Deseja excluir o lançamento da unidade ${c.unidadeIdentificacao}?`)) {
-                              deleteCommission(c.id);
-                            }
-                          }}
-                          className="p-1 rounded-md text-red-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 transition-colors"
-                          title="Excluir Lançamento"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                        {currentUser.role === 'admin' && (
+                          <button
+                            onClick={() => {
+                              if (window.confirm(`Deseja excluir o lançamento da unidade ${c.unidadeIdentificacao}?`)) {
+                                deleteCommission(c.id);
+                              }
+                            }}
+                            className="p-1 rounded-md text-red-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 transition-colors"
+                            title="Excluir Lançamento (Exclusivo Administrador)"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
                       </div>
                     </td>
                   )}

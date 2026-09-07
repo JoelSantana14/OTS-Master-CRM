@@ -283,8 +283,21 @@ export const KanbanFunnel: React.FC = () => {
                 </div>
               </div>
 
-              {/* Card List */}
-              <div className="p-2.5 space-y-2.5 overflow-y-auto flex-1">
+              {/* Card List & Drop Target */}
+              <div
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = 'move';
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  const leadId = e.dataTransfer.getData('text/plain');
+                  if (leadId) {
+                    updateLeadStatus(leadId, column.id);
+                  }
+                }}
+                className="p-2.5 space-y-2.5 overflow-y-auto flex-1 min-h-[120px]"
+              >
                 {colLeads.map((lead) => {
                   const next = getNextStage(lead.status);
                   const prev = getPreviousStage(lead.status);
@@ -293,8 +306,13 @@ export const KanbanFunnel: React.FC = () => {
                     <div
                       key={lead.id}
                       id={`kanban-card-${lead.id}`}
+                      draggable
+                      onDragStart={(e) => {
+                        e.dataTransfer.setData('text/plain', lead.id);
+                        e.dataTransfer.effectAllowed = 'move';
+                      }}
                       onClick={() => setSelectedLeadForModal(lead)}
-                      className="bg-white p-3.5 rounded-xl border border-slate-200/90 shadow-xs hover:border-emerald-500/60 hover:shadow-md transition-all cursor-pointer space-y-2.5 group"
+                      className="bg-white p-3.5 rounded-xl border border-slate-200/90 shadow-xs hover:border-emerald-500/60 hover:shadow-md active:opacity-75 transition-all cursor-grab active:cursor-grabbing space-y-2.5 group"
                     >
                       <div className="flex items-start justify-between">
                         <div>

@@ -515,6 +515,26 @@ export interface AuditLog {
   acao: string;
   entidade: string;
   detalhes: string;
+  recordId?: string;
+  snapshot?: any;
+}
+
+export interface DeletionAuditRecord {
+  id: string;
+  timestamp: string;
+  dataHoraFormatada: string;
+  deletedBy: {
+    userId: string;
+    userName: string;
+    userEmail?: string;
+    userRole: UserRole;
+  };
+  entityType: 'usuario_corretor' | 'cliente_lead' | 'imovel_unidade' | 'equipe' | 'comissao' | 'outros';
+  recordId: string;
+  recordIdentifier: string;
+  detalhes: string;
+  motivo?: string;
+  snapshot?: any;
 }
 
 export interface PartnerBroker {

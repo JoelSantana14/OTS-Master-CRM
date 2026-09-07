@@ -1,6 +1,7 @@
 import { initializeApp, getApps } from 'firebase/app';
-import { getFirestore, doc, getDoc, setDoc, onSnapshot, Unsubscribe, disableNetwork, setLogLevel } from 'firebase/firestore';
+import { getFirestore, doc, getDoc, setDoc, onSnapshot, Unsubscribe, disableNetwork, setLogLevel, collection, query, orderBy, limit } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
+import { DeletionAuditRecord } from '../types';
 
 // Silence internal Firestore SDK verbose logs/backoff warnings
 try {
@@ -12,18 +13,39 @@ export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId || undefi
 
 const STATE_DOC_REF = doc(db, 'crm_state', 'main_database');
 
+const QUOTA_STORAGE_KEY = 'jv_firestore_quota_exceeded_day';
+
 let lastCloudStateHash: string = '';
+let lastSavedMutationId: string = '';
 let isQuotaExceeded: boolean = false;
 let activeUnsubscribe: Unsubscribe | null = null;
+
+// Auto-reset quota flag on module load so app always attempts fresh cloud sync on page refresh
+resetQuotaExceededFlag();
 
 export function getIsQuotaExceeded(): boolean {
   return isQuotaExceeded;
 }
 
+export function resetQuotaExceededFlag(): void {
+  isQuotaExceeded = false;
+  try {
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem(QUOTA_STORAGE_KEY);
+    }
+  } catch {}
+}
+
 function handleQuotaExceeded() {
   if (!isQuotaExceeded) {
     isQuotaExceeded = true;
-    console.warn('Firestore cloud quota limit reached. Disabling network and operating in persistent LocalStorage mode.');
+    try {
+      if (typeof window !== 'undefined') {
+        const today = new Date().toISOString().split('T')[0];
+        localStorage.setItem(QUOTA_STORAGE_KEY, today);
+      }
+    } catch {}
+    console.warn('Firestore cloud quota limit reached. Operating in persistent LocalStorage mode.');
   }
   if (activeUnsubscribe) {
     try {
@@ -49,14 +71,20 @@ function isQuotaError(err: any): boolean {
   );
 }
 
-function serializeStateForCompare(state: any): string {
-  if (!state) return '';
-  const { updatedAt, ...rest } = state;
-  try {
-    return JSON.stringify(rest);
-  } catch {
-    return '';
+// Canonical JSON serialization with recursively sorted keys to guarantee deterministic hash comparisons
+function canonicalSerialize(obj: any): string {
+  if (obj === null || obj === undefined) return '';
+  if (typeof obj !== 'object') return JSON.stringify(obj);
+  if (Array.isArray(obj)) {
+    return '[' + obj.map((item) => canonicalSerialize(item)).join(',') + ']';
   }
+  const keys = Object.keys(obj).sort();
+  const pairs: string[] = [];
+  for (const key of keys) {
+    if (key === 'updatedAt' || key === 'lastMutationId') continue;
+    pairs.push(JSON.stringify(key) + ':' + canonicalSerialize(obj[key]));
+  }
+  return '{' + pairs.join(',') + '}';
 }
 
 export async function loadStateFromCloud(): Promise<any | null> {
@@ -65,7 +93,10 @@ export async function loadStateFromCloud(): Promise<any | null> {
     const snap = await getDoc(STATE_DOC_REF);
     if (snap.exists()) {
       const data = snap.data();
-      lastCloudStateHash = serializeStateForCompare(data);
+      lastCloudStateHash = canonicalSerialize(data);
+      if (data.lastMutationId) {
+        lastSavedMutationId = data.lastMutationId;
+      }
       console.log('State loaded successfully from Firestore cloud.');
       return data;
     }
@@ -102,9 +133,29 @@ export function subscribeToCloudState(
       STATE_DOC_REF,
       (snap) => {
         if (snap.exists()) {
+          // 1. If snapshot represents in-flight local writes, never overwrite local state
+          if (snap.metadata.hasPendingWrites) {
+            return;
+          }
+
           const data = snap.data();
-          lastCloudStateHash = serializeStateForCompare(data);
-          console.log('Real-time update received from Firestore cloud.');
+
+          // 2. If snapshot has the mutationId we just sent, it is our own server confirmation echo
+          if (data.lastMutationId && data.lastMutationId === lastSavedMutationId) {
+            return;
+          }
+
+          // 3. Compare canonical hashes to prevent redundant or out-of-order re-hydrations
+          const incomingHash = canonicalSerialize(data);
+          if (incomingHash && incomingHash === lastCloudStateHash) {
+            return;
+          }
+
+          lastCloudStateHash = incomingHash;
+          if (data.lastMutationId) {
+            lastSavedMutationId = data.lastMutationId;
+          }
+          console.log('Real-time remote update received from Firestore cloud.');
           onData(data, true);
         } else {
           onData(null, false);
@@ -140,24 +191,29 @@ export function subscribeToCloudState(
   }
 }
 
-export async function saveStateToCloud(state: any): Promise<boolean> {
+export async function saveStateToCloud(state: any, force = false): Promise<boolean> {
   if (isQuotaExceeded) {
     return false;
   }
 
-  const currentHash = serializeStateForCompare(state);
-  if (currentHash && currentHash === lastCloudStateHash) {
+  const currentHash = canonicalSerialize(state);
+  if (!force && currentHash && currentHash === lastCloudStateHash) {
     // Data has not changed since last cloud update — skip redundant write
     return true;
   }
 
+  // Generate a distinct mutation ID for this write operation
+  const mutationId = 'mut_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+  lastSavedMutationId = mutationId;
+  lastCloudStateHash = currentHash;
+
   try {
     await setDoc(STATE_DOC_REF, {
       ...state,
+      lastMutationId: mutationId,
       updatedAt: new Date().toISOString()
-    }, { merge: true });
-    lastCloudStateHash = currentHash;
-    console.log('State saved successfully to Firestore cloud.');
+    });
+    console.log('State saved successfully to Firestore cloud (mutation: ' + mutationId + ').');
     return true;
   } catch (err: any) {
     if (isQuotaError(err)) {
@@ -186,6 +242,61 @@ export async function updateUserProfilePhotoInFirestore(userId: string, avatarUr
     }
     console.error(`Error updating user ${userId} avatar in Firestore:`, err);
     return false;
+  }
+}
+
+export async function logDeletionToFirestore(record: DeletionAuditRecord): Promise<boolean> {
+  if (isQuotaExceeded) return false;
+  try {
+    const logDocRef = doc(db, 'deletion_audit_logs', record.id);
+    await setDoc(logDocRef, {
+      ...record,
+      createdAt: new Date().toISOString(),
+    });
+    console.log(`Deletion log ${record.id} recorded in Firestore.`);
+    return true;
+  } catch (err: any) {
+    if (isQuotaError(err)) {
+      handleQuotaExceeded();
+    } else {
+      console.warn('Could not save deletion log to Firestore:', err);
+    }
+    return false;
+  }
+}
+
+export function subscribeToDeletionLogs(callback: (logs: DeletionAuditRecord[]) => void): Unsubscribe {
+  if (isQuotaExceeded) {
+    callback([]);
+    return () => {};
+  }
+
+  try {
+    const logsCollection = collection(db, 'deletion_audit_logs');
+    const logsQuery = query(logsCollection, orderBy('timestamp', 'desc'), limit(150));
+
+    const unsubscribe = onSnapshot(
+      logsQuery,
+      (snapshot) => {
+        const logs: DeletionAuditRecord[] = [];
+        snapshot.forEach((docSnap) => {
+          logs.push(docSnap.data() as DeletionAuditRecord);
+        });
+        callback(logs);
+      },
+      (err) => {
+        if (isQuotaError(err)) {
+          handleQuotaExceeded();
+        } else {
+          console.warn('Error listening to deletion logs in Firestore:', err);
+        }
+      }
+    );
+
+    return unsubscribe;
+  } catch (err) {
+    console.warn('Could not subscribe to deletion logs:', err);
+    return () => {};
   }
 }
 

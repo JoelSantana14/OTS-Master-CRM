@@ -8,5 +8,13 @@ service cloud.firestore {
     match /crm_state/{document} {
       allow read, write: if true;
     }
+    
+    match /deletion_audit_logs/{document} {
+      allow read, write: if true;
+    }
+
+    match /users/{document} {
+      allow read, write: if true;
+    }
   }
 }
