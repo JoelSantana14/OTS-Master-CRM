@@ -8,8 +8,80 @@ try {
   setLogLevel('silent');
 } catch {}
 
-const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId || undefined);
+const getEnvVar = (key1: string, key2: string): string | undefined => {
+  try {
+    const metaEnv = (import.meta as any).env;
+    if (metaEnv) {
+      if (metaEnv[key1]) return metaEnv[key1];
+      if (metaEnv[key2]) return metaEnv[key2];
+    }
+  } catch {}
+  try {
+    if (typeof process !== 'undefined' && process.env) {
+      if (process.env[key1]) return process.env[key1];
+      if (process.env[key2]) return process.env[key2];
+    }
+  } catch {}
+  return undefined;
+};
+
+const activeFirebaseConfig = {
+  apiKey: getEnvVar('VITE_FIREBASE_API_KEY', 'NEXT_PUBLIC_FIREBASE_API_KEY') || firebaseConfig.apiKey,
+  authDomain: getEnvVar('VITE_FIREBASE_AUTH_DOMAIN', 'NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN') || firebaseConfig.authDomain,
+  projectId: getEnvVar('VITE_FIREBASE_PROJECT_ID', 'NEXT_PUBLIC_FIREBASE_PROJECT_ID') || firebaseConfig.projectId,
+  storageBucket: getEnvVar('VITE_FIREBASE_STORAGE_BUCKET', 'NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET') || firebaseConfig.storageBucket,
+  messagingSenderId: getEnvVar('VITE_FIREBASE_MESSAGING_SENDER_ID', 'NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID') || firebaseConfig.messagingSenderId,
+  appId: getEnvVar('VITE_FIREBASE_APP_ID', 'NEXT_PUBLIC_FIREBASE_APP_ID') || firebaseConfig.appId,
+  firestoreDatabaseId: getEnvVar('VITE_FIREBASE_DATABASE_ID', 'FIREBASE_DATABASE_ID') || (firebaseConfig as any).firestoreDatabaseId,
+};
+
+let app: any;
+let db: any;
+
+try {
+  console.group('🔥 [Firebase App & Database Initialization]');
+  console.log('Timestamp:', new Date().toISOString());
+  console.log('Active Configuration Summary:', {
+    projectId: activeFirebaseConfig.projectId,
+    firestoreDatabaseId: activeFirebaseConfig.firestoreDatabaseId || '(default)',
+    authDomain: activeFirebaseConfig.authDomain,
+    hasApiKey: Boolean(activeFirebaseConfig.apiKey),
+    apiKeyPrefix: activeFirebaseConfig.apiKey ? String(activeFirebaseConfig.apiKey).substring(0, 8) + '...' : 'MISSING',
+    storageBucket: activeFirebaseConfig.storageBucket,
+    appId: activeFirebaseConfig.appId ? String(activeFirebaseConfig.appId).substring(0, 10) + '...' : 'MISSING',
+  });
+
+  if (getApps().length === 0) {
+    app = initializeApp(activeFirebaseConfig);
+    console.log('✅ Firebase App initialized successfully:', app.name);
+  } else {
+    app = getApps()[0];
+    console.log('ℹ️ Existing Firebase App instance retrieved:', app.name);
+  }
+
+  db = getFirestore(app, activeFirebaseConfig.firestoreDatabaseId || undefined);
+  console.log('✅ Firestore Instance created successfully. Target Database:', activeFirebaseConfig.firestoreDatabaseId || '(default)');
+  console.groupEnd();
+} catch (initErr: any) {
+  console.groupEnd();
+  console.error('❌ [Firebase Initialization Critical Error]:', {
+    message: initErr?.message || String(initErr),
+    code: initErr?.code || 'INIT_FAILED',
+    name: initErr?.name,
+    stack: initErr?.stack,
+    configUsed: activeFirebaseConfig,
+    timestamp: new Date().toISOString(),
+  });
+
+  try {
+    app = getApps()[0] || initializeApp(activeFirebaseConfig);
+    db = getFirestore(app);
+  } catch (fallbackErr) {
+    console.error('❌ [Firebase Fallback Initialization Failed]:', fallbackErr);
+  }
+}
+
+export { db };
 
 const STATE_DOC_REF = doc(db, 'crm_state', 'main_database');
 
@@ -97,15 +169,21 @@ export async function loadStateFromCloud(): Promise<any | null> {
       if (data.lastMutationId) {
         lastSavedMutationId = data.lastMutationId;
       }
-      console.log('State loaded successfully from Firestore cloud.');
+      console.log('✅ [Firestore Cloud] State loaded successfully from main_database document.');
       return data;
     }
+    console.log('ℹ️ [Firestore Cloud] crm_state/main_database document does not exist yet. Initializing with local defaults.');
     return null;
   } catch (err: any) {
+    console.error('❌ [Firestore Cloud Error - loadStateFromCloud]:', {
+      errorCode: err?.code || 'UNKNOWN_ERROR',
+      errorMessage: err?.message || String(err),
+      errorName: err?.name,
+      timestamp: new Date().toISOString(),
+      rawError: err,
+    });
     if (isQuotaError(err)) {
       handleQuotaExceeded();
-    } else {
-      console.warn('Could not load state from Firestore cloud (using local fallback):', err);
     }
     return null;
   }
@@ -155,18 +233,24 @@ export function subscribeToCloudState(
           if (data.lastMutationId) {
             lastSavedMutationId = data.lastMutationId;
           }
-          console.log('Real-time remote update received from Firestore cloud.');
+          console.log('✅ [Firestore Cloud] Real-time remote update received successfully.');
           onData(data, true);
         } else {
           onData(null, false);
         }
       },
       (err: any) => {
+        console.error('❌ [Firestore Cloud Listener Error]:', {
+          errorCode: err?.code || 'LISTENER_ERROR',
+          errorMessage: err?.message || String(err),
+          errorName: err?.name,
+          timestamp: new Date().toISOString(),
+          rawError: err,
+        });
         if (isQuotaError(err)) {
           handleQuotaExceeded();
           onData(null, false);
         } else {
-          console.warn('Could not subscribe to Firestore cloud state:', err);
           if (onError) onError(err);
         }
       }
@@ -183,6 +267,11 @@ export function subscribeToCloudState(
       } catch {}
     };
   } catch (err: any) {
+    console.error('❌ [Firestore Cloud Subscription Exception]:', {
+      errorCode: err?.code || 'SUBSCRIPTION_EXCEPTION',
+      errorMessage: err?.message || String(err),
+      rawError: err,
+    });
     if (isQuotaError(err)) {
       handleQuotaExceeded();
     }
@@ -213,13 +302,19 @@ export async function saveStateToCloud(state: any, force = false): Promise<boole
       lastMutationId: mutationId,
       updatedAt: new Date().toISOString()
     });
-    console.log('State saved successfully to Firestore cloud (mutation: ' + mutationId + ').');
+    console.log(`✅ [Firestore Cloud Save Success] State saved (mutation: ${mutationId}).`);
     return true;
   } catch (err: any) {
+    console.error('❌ [Firestore Cloud Save ERROR]:', {
+      errorCode: err?.code || 'SAVE_FAILED',
+      errorMessage: err?.message || String(err),
+      errorName: err?.name,
+      mutationId,
+      timestamp: new Date().toISOString(),
+      rawError: err,
+    });
     if (isQuotaError(err)) {
       handleQuotaExceeded();
-    } else {
-      console.warn('Could not save state to Firestore cloud:', err);
     }
     return false;
   }
@@ -299,6 +394,101 @@ export function subscribeToDeletionLogs(callback: (logs: DeletionAuditRecord[]) 
     return () => {};
   }
 }
+
+export function getFirebaseConfigDiagnostics() {
+  const getSource = (key1: string, key2: string, fallbackVal: any) => {
+    try {
+      const metaEnv = (import.meta as any).env;
+      if (metaEnv) {
+        if (metaEnv[key1]) return { value: metaEnv[key1], source: 'import.meta.env (' + key1 + ')' };
+        if (metaEnv[key2]) return { value: metaEnv[key2], source: 'import.meta.env (' + key2 + ')' };
+      }
+    } catch {}
+    try {
+      if (typeof process !== 'undefined' && process.env) {
+        if (process.env[key1]) return { value: process.env[key1], source: 'process.env (' + key1 + ')' };
+        if (process.env[key2]) return { value: process.env[key2], source: 'process.env (' + key2 + ')' };
+      }
+    } catch {}
+    return { value: fallbackVal, source: 'firebase-applet-config.json (arquivo interno)' };
+  };
+
+  return {
+    apiKey: getSource('VITE_FIREBASE_API_KEY', 'NEXT_PUBLIC_FIREBASE_API_KEY', firebaseConfig.apiKey),
+    projectId: getSource('VITE_FIREBASE_PROJECT_ID', 'NEXT_PUBLIC_FIREBASE_PROJECT_ID', firebaseConfig.projectId),
+    authDomain: getSource('VITE_FIREBASE_AUTH_DOMAIN', 'NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN', firebaseConfig.authDomain),
+    storageBucket: getSource('VITE_FIREBASE_STORAGE_BUCKET', 'NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET', firebaseConfig.storageBucket),
+    messagingSenderId: getSource('VITE_FIREBASE_MESSAGING_SENDER_ID', 'NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID', firebaseConfig.messagingSenderId),
+    appId: getSource('VITE_FIREBASE_APP_ID', 'NEXT_PUBLIC_FIREBASE_APP_ID', firebaseConfig.appId),
+    firestoreDatabaseId: getSource('VITE_FIREBASE_DATABASE_ID', 'FIREBASE_DATABASE_ID', (firebaseConfig as any).firestoreDatabaseId),
+    activeConfig: {
+      projectId: activeFirebaseConfig.projectId,
+      firestoreDatabaseId: activeFirebaseConfig.firestoreDatabaseId || '(default)',
+      authDomain: activeFirebaseConfig.authDomain,
+      hasApiKey: Boolean(activeFirebaseConfig.apiKey),
+    },
+    isQuotaExceeded: getIsQuotaExceeded(),
+    lastSavedMutationId,
+  };
+}
+
+export async function testFirestoreConnection(): Promise<{
+  success: boolean;
+  latencyMs: number;
+  readSuccess: boolean;
+  writeSuccess: boolean;
+  docExists: boolean;
+  error?: string;
+  errorCode?: string;
+  details?: any;
+}> {
+  const startTime = Date.now();
+  let readSuccess = false;
+  let writeSuccess = false;
+  let docExists = false;
+
+  try {
+    // 1. Test Read from crm_state/main_database
+    const snap = await getDoc(STATE_DOC_REF);
+    readSuccess = true;
+    docExists = snap.exists();
+
+    // 2. Test Write Ping with timestamp
+    const pingRef = doc(db, 'crm_state', 'connection_ping');
+    await setDoc(pingRef, {
+      lastPingAt: new Date().toISOString(),
+      testedBy: 'FirebaseConnectionStatus diagnostic tool',
+      timestamp: Date.now(),
+    }, { merge: true });
+    writeSuccess = true;
+
+    const latencyMs = Date.now() - startTime;
+    return {
+      success: true,
+      latencyMs,
+      readSuccess,
+      writeSuccess,
+      docExists,
+    };
+  } catch (err: any) {
+    const latencyMs = Date.now() - startTime;
+    const errorCode = err?.code || 'UNKNOWN_ERROR';
+    const errorMsg = err?.message || String(err);
+    console.error('Firestore Connection Test Failed:', err);
+
+    return {
+      success: false,
+      latencyMs,
+      readSuccess,
+      writeSuccess,
+      docExists,
+      error: errorMsg,
+      errorCode,
+      details: err,
+    };
+  }
+}
+
 
 
 

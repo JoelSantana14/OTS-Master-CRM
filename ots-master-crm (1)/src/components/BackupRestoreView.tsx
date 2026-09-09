@@ -16,6 +16,7 @@ import {
   Flame,
   RefreshCw,
 } from 'lucide-react';
+import { FirebaseConnectionStatus } from './FirebaseConnectionStatus';
 
 export const BackupRestoreView: React.FC = () => {
   const {
@@ -139,6 +140,9 @@ export const BackupRestoreView: React.FC = () => {
           <span>{restoreError}</span>
         </div>
       )}
+
+      {/* Diagnóstico em Tempo Real do Firebase Cloud */}
+      <FirebaseConnectionStatus variant="card" />
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         {/* Export Card */}

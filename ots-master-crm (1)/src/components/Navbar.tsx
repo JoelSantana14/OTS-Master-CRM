@@ -29,6 +29,7 @@ import { ExportReportsModal } from './ExportReportsModal';
 import { FollowUpCentralModal } from './FollowUpCentralModal';
 import { UserProfileModal } from './UserProfileModal';
 import { GlobalSearchBar } from './GlobalSearchBar';
+import { FirebaseConnectionStatus } from './FirebaseConnectionStatus';
 import { User, Camera } from 'lucide-react';
 
 interface NavbarProps {
@@ -254,6 +255,9 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenPrintModal }) => {
             <Sparkles className="w-3.5 h-3.5 text-indigo-600 dark:text-indigo-400 animate-pulse" />
             <span>Vivi IA</span>
           </button>
+
+          {/* Real-time Firebase & .env Connection Status Diagnostic Pill */}
+          <FirebaseConnectionStatus variant="pill" />
 
           {/* Admin Release Toggles Summary in Navbar if Admin */}
           {currentUser.role === 'admin' && (

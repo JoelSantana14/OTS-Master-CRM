@@ -54,13 +54,21 @@ const MainLayout: React.FC = () => {
 
   useEffect(() => {
     if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('/firebase-messaging-sw.js')
-        .then((reg) => {
-          console.log('PWA Service Worker registered on app load:', reg.scope);
-        })
-        .catch((err) => {
-          console.warn('PWA Service Worker registration failed on app load:', err);
-        });
+      const registerSW = () => {
+        navigator.serviceWorker.register('/firebase-messaging-sw.js')
+          .then((reg) => {
+            console.log('PWA Service Worker registered asynchronously (non-blocking):', reg.scope);
+          })
+          .catch((err) => {
+            console.warn('PWA Service Worker registration notice (non-blocking):', err);
+          });
+      };
+
+      if (document.readyState === 'complete') {
+        setTimeout(registerSW, 1500);
+      } else {
+        window.addEventListener('load', () => setTimeout(registerSW, 1500));
+      }
     }
   }, []);
 

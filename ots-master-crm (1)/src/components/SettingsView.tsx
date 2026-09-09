@@ -3,6 +3,7 @@ import { useApp } from '../context/AppContext';
 import { Building, Settings, Mail, ShieldCheck, Layers, Check, Plus, Trash2, Building2, LayoutList, ArrowUp, ArrowDown, Edit2, RotateCcw, Palette, X } from 'lucide-react';
 import { DevelopmentItem } from '../types';
 import { DEFAULT_KANBAN_COLUMNS, KanbanColumn } from './KanbanFunnel';
+import { FirebaseConnectionStatus } from './FirebaseConnectionStatus';
 
 export const SettingsView: React.FC = () => {
   const { settings, updateSettings, currentUser } = useApp();
@@ -317,6 +318,9 @@ export const SettingsView: React.FC = () => {
           <span>Configurações atualizadas com sucesso em todo o sistema!</span>
         </div>
       )}
+
+      {/* Diagnóstico em Tempo Real do Banco de Dados Firestore e .env */}
+      <FirebaseConnectionStatus variant="card" />
 
       {/* Múltiplos Empreendimentos Section */}
       <div className="bg-white dark:bg-slate-900 p-6 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-xs space-y-4">

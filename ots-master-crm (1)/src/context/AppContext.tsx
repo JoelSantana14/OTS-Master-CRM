@@ -557,7 +557,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   useEffect(() => {
     const unsubscribe = subscribeToCloudState((cloudData, exists) => {
       if (!exists) {
-        console.log('No cloud database document found. App will initialize with default or local storage states.');
+        console.log('No cloud database document found. App will initialize with local or default states.');
         setIsCloudHydrated(true);
         return;
       }
@@ -567,14 +567,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return;
       }
 
-      // Conflict Resolution: ONLY reject cloud update if the user has explicitly edited data in this session AND cloud snapshot is older
+      // Conflict Resolution: Compare timestamps
       if (cloudData.updatedAt) {
         const cloudTime = new Date(cloudData.updatedAt).getTime();
-        if (hasUserEditedRef.current && cloudTime && lastLocalSaveTimeRef.current && cloudTime < lastLocalSaveTimeRef.current - 1500) {
-          console.warn('Received cloud update older than current local user session edit. Preserving local session state.', { cloudTime, localTime: lastLocalSaveTimeRef.current });
+        const localTime = lastLocalSaveTimeRef.current || 0;
+
+        // If local state (from LocalStorage or current session) is newer than Firestore cloud data, preserve local state & sync up
+        if (localTime > 0 && localTime > cloudTime) {
+          console.log('Local state is newer than cloud snapshot. Preserving local state and pushing to cloud...', { localTime, cloudTime });
           setIsCloudHydrated(true);
+          if (stateRef.current) {
+            saveStateToCloud(stateRef.current, true);
+          }
           return;
         }
+
         if (cloudTime) {
           lastLocalSaveTimeRef.current = cloudTime;
         }
@@ -701,6 +708,78 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return () => unsubscribe();
   }, []);
 
+  // Universal Auto-Sync Effect: Whenever ANY React state changes, persist immediately to LocalStorage and debounce push to Firestore
+  useEffect(() => {
+    if (!isCloudHydrated) return;
+
+    const nowIso = new Date().toISOString();
+    lastLocalSaveTimeRef.current = new Date(nowIso).getTime();
+
+    const dbState = {
+      settings,
+      users,
+      teams,
+      units,
+      leads,
+      visits,
+      tasks,
+      scales,
+      attendances,
+      rouletteHistory,
+      commissions,
+      auditLogs,
+      notifications,
+      shiftRules,
+      deletedLeads,
+      tags,
+      simulatorPolicyRules,
+      partnerAgencies,
+      partnerVisits,
+      proposalApprovalRequests,
+      currentUserId: currentUser?.id || 'user-admin',
+      isAuthenticated,
+      updatedAt: nowIso,
+    };
+
+    stateRef.current = dbState;
+
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(dbState));
+    } catch (e) {
+      console.error('LocalStorage save error:', e);
+    }
+
+    const timer = setTimeout(() => {
+      saveStateToCloud(dbState);
+    }, 1000);
+
+    return () => clearTimeout(timer);
+  }, [
+    isCloudHydrated,
+    settings,
+    users,
+    teams,
+    units,
+    leads,
+    visits,
+    tasks,
+    scales,
+    attendances,
+    rouletteHistory,
+    commissions,
+    auditLogs,
+    notifications,
+    shiftRules,
+    deletedLeads,
+    tags,
+    simulatorPolicyRules,
+    partnerAgencies,
+    partnerVisits,
+    proposalApprovalRequests,
+    currentUser,
+    isAuthenticated,
+  ]);
+
   // Real-time synchronization for Deletion Audit Logs
   useEffect(() => {
     const unsubDeletion = subscribeToDeletionLogs((logs) => {
@@ -759,6 +838,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     password?: string
   ): { success: boolean; reason: 'not_found' | 'invalid_password' | 'inactive' | 'success'; message: string } => {
     const cleanEmail = email.trim().toLowerCase();
+    console.group(`🔑 [Auth Service] Login attempt for: ${cleanEmail}`);
+    console.log('Timestamp:', new Date().toISOString());
+
     let user = users.find((u) => u.email.trim().toLowerCase() === cleanEmail);
 
     // Fallback if admin is somehow not currently in state array
@@ -774,6 +856,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     if (!user) {
+      console.warn('❌ [Auth Error]: E-mail not registered in system:', cleanEmail);
+      console.groupEnd();
       return {
         success: false,
         reason: 'not_found',
@@ -782,6 +866,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     if (user.active === false) {
+      console.warn('❌ [Auth Error]: User account is inactive:', { email: cleanEmail, userId: user.id });
+      console.groupEnd();
       return {
         success: false,
         reason: 'inactive',
@@ -793,6 +879,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const cleanPassword = (password || '').trim();
 
     if (cleanPassword !== effectiveUserPassword) {
+      console.warn('❌ [Auth Error]: Invalid password supplied for user:', { email: cleanEmail, userId: user.id });
+      console.groupEnd();
       return {
         success: false,
         reason: 'invalid_password',
@@ -802,6 +890,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     setCurrentUser(user);
     setIsAuthenticated(true);
+    console.log('✅ [Auth Success]: User authenticated successfully:', {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+    });
+    console.groupEnd();
+
     logAction(
       'Login no Sistema',
       'Autenticação',
