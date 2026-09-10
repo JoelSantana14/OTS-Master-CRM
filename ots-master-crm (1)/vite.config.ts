@@ -15,11 +15,13 @@ export default defineConfig(() => {
       chunkSizeWarningLimit: 3000,
       rollupOptions: {
         output: {
-          manualChunks: {
-            vendor: ['react', 'react-dom'],
-            firebase: ['firebase/app', 'firebase/firestore'],
-            icons: ['lucide-react'],
-            charts: ['recharts'],
+          manualChunks(id) {
+            if (id.includes('node_modules')) {
+              if (id.includes('firebase')) return 'firebase';
+              if (id.includes('lucide-react')) return 'icons';
+              if (id.includes('recharts')) return 'charts';
+              return 'vendor';
+            }
           },
         },
       },
